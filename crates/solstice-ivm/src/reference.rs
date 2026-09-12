@@ -8,15 +8,33 @@
 //! evaluator over `Vec<Row>`, SQLite itself via `IR → SQL`, and the incremental
 //! path. Oracle (b) arrives with `solstice-store`.
 
+use crate::delta::Batch;
 use crate::graph::{Graph, GraphBuilder};
 use crate::operator::{OpCx, ScanRequest};
-use crate::ops::{Filter, Project, Source, TopK};
+use crate::ops::{Filter, Join1N, Project, Source, TopK};
 use crate::order::{cmp_entry, cmp_to_cursor, Dir};
 use crate::predicate::{Params, Predicate};
 use crate::relation::Relation;
 use crate::schema::TableId;
-use crate::value::{ColId, Row, RowKey};
+use crate::value::{ColId, Row, RowKey, Value};
+use std::cmp::Ordering;
 use std::collections::BTreeMap;
+
+/// A 1:N traversal, described the way the query IR would describe it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct JoinSpec {
+    pub child_table: TableId,
+    pub child_pk: ColId,
+    /// Column of the parent row children point at.
+    pub parent_key: ColId,
+    /// Column of the child row holding the foreign key.
+    pub child_fk: ColId,
+    /// Filters that narrow the child relation before the traversal.
+    pub child_filters: Vec<Predicate>,
+    pub order: Vec<(ColId, Dir)>,
+    pub limit: usize,
+    pub slack: usize,
+}
 
 /// One step of a reference plan, mirroring one operator.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -32,6 +50,48 @@ pub enum Stage {
         k: usize,
         slack: usize,
     },
+    Join(JoinSpec),
+}
+
+/// The base relations a plan reads.
+///
+/// A plan used to be a function of one relation. A join makes it a function of
+/// several, and threading a map through is less work than pretending the child
+/// table is somehow part of the parent's input.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Tables {
+    tables: BTreeMap<TableId, Relation>,
+}
+
+impl Tables {
+    pub fn new() -> Self {
+        Tables::default()
+    }
+
+    pub fn with(mut self, table: TableId, rel: Relation) -> Self {
+        self.tables.insert(table, rel);
+        self
+    }
+
+    /// The named relation, or an empty one. A query may legitimately read a
+    /// table nothing has written yet.
+    pub fn get(&self, table: TableId) -> Relation {
+        self.tables.get(&table).cloned().unwrap_or_default()
+    }
+
+    pub fn table(&mut self, table: TableId) -> &mut Relation {
+        self.tables.entry(table).or_default()
+    }
+
+    /// The same tables with one table's batch applied — the `R ⊎ Δ` side of the
+    /// delta law.
+    pub fn with_applied(&self, deltas: &[(TableId, Batch)]) -> Tables {
+        let mut out = self.clone();
+        for (table, batch) in deltas {
+            out.table(*table).apply(batch);
+        }
+        out
+    }
 }
 
 /// A reference plan: stages applied in order, wholesale, over a whole relation.
@@ -49,7 +109,19 @@ pub struct Reference {
 }
 
 impl Reference {
+    /// # Panics
+    ///
+    /// If a `Join` is not the last stage. Its output is hierarchical, and
+    /// nothing downstream in M0 reads a child collection: a `TopK` above it
+    /// would refill by scanning the *parent* table and hand the view rows with
+    /// no children attached. The planner puts `TopK` below the join precisely so
+    /// that this configuration never arises (see the [`crate::ops`] docs).
     pub fn new(table: TableId, pk: ColId, stages: Vec<Stage>) -> Self {
+        let body = stages.len().saturating_sub(1);
+        assert!(
+            stages[..body].iter().all(|s| !matches!(s, Stage::Join(_))),
+            "a join must be the last stage of a plan"
+        );
         Reference {
             table,
             pk,
@@ -117,6 +189,39 @@ impl Reference {
                     }
                     b.add(Box::new(top), vec![node])
                 }
+                Stage::Join(spec) => {
+                    // The child source hydrates to nothing: a million comments
+                    // must not be materialised so the join can keep three per
+                    // issue. Children arrive per parent, by scan.
+                    let mut child = b.source(
+                        spec.child_table,
+                        Box::new(Source::new(spec.child_table, spec.child_pk).deltas_only()),
+                    );
+                    for pred in &spec.child_filters {
+                        child = b.add(
+                            Box::new(Filter::new(pred.clone(), self.params.clone())),
+                            vec![child],
+                        );
+                    }
+
+                    let mut join = Join1N::new(
+                        spec.child_table,
+                        spec.parent_key,
+                        spec.child_fk,
+                        spec.order.clone(),
+                        spec.limit,
+                    )
+                    .with_slack(spec.slack);
+                    // Same reason as `TopK` above: the per-parent windows refill
+                    // from the base table, so they need the child filters too.
+                    if !spec.child_filters.is_empty() {
+                        join = join.with_child_filter(
+                            Predicate::and(spec.child_filters.clone()),
+                            self.params.clone(),
+                        );
+                    }
+                    b.add(Box::new(join), vec![node, child])
+                }
             };
         }
 
@@ -124,8 +229,8 @@ impl Reference {
     }
 
     /// Evaluate from scratch. O(relation) by construction, which is the point.
-    pub fn eval(&self, input: &Relation) -> Relation {
-        let mut current = input.clone();
+    pub fn eval(&self, tables: &Tables) -> Relation {
+        let mut current = tables.get(self.table);
         for stage in &self.stages {
             current = match stage {
                 Stage::Filter { pred } => current
@@ -145,6 +250,35 @@ impl Reference {
                     rows.into_iter()
                         .take(*k)
                         .map(|(key, row)| (key.clone(), row.clone()))
+                        .collect()
+                }
+                Stage::Join(spec) => {
+                    // For every parent, re-scan the whole child table. The
+                    // operator holds windows and refills; this one just looks.
+                    let child_rel = tables.get(spec.child_table);
+                    current
+                        .iter()
+                        .map(|(key, row)| {
+                            let parent_key = row.get(spec.parent_key);
+                            let mut kids: Vec<(&RowKey, &Row)> = child_rel
+                                .iter()
+                                .filter(|(_, c)| {
+                                    c.get(spec.child_fk).sql_cmp(parent_key)
+                                        == Some(Ordering::Equal)
+                                        && spec
+                                            .child_filters
+                                            .iter()
+                                            .all(|p| p.matches(c, &self.params))
+                                })
+                                .collect();
+                            kids.sort_by(|a, b| cmp_entry(*a, *b, &spec.order));
+                            let kids: Vec<Row> = kids
+                                .into_iter()
+                                .take(spec.limit)
+                                .map(|(_, c)| c.clone())
+                                .collect();
+                            (key.clone(), row.with_appended(Value::rows(kids)))
+                        })
                         .collect()
                 }
             };
@@ -167,6 +301,16 @@ impl MemStore {
     pub fn new() -> Self {
         MemStore {
             tables: BTreeMap::new(),
+            refills: 0,
+            rows_refilled: 0,
+        }
+    }
+
+    /// A store holding exactly these relations — the same base state the oracle
+    /// is handed, so the two sides of the delta law cannot drift apart.
+    pub fn over(tables: &Tables) -> MemStore {
+        MemStore {
+            tables: tables.tables.clone(),
             refills: 0,
             rows_refilled: 0,
         }
@@ -408,8 +552,61 @@ mod tests {
             }],
         );
         assert_eq!(
-            plan.eval(&rel(&[(1, 10), (2, 40), (3, 30), (4, 20)])),
+            plan.eval(&Tables::new().with(7, rel(&[(1, 10), (2, 40), (3, 30), (4, 20)]))),
             rel(&[(2, 40), (3, 30)])
+        );
+    }
+
+    #[test]
+    fn the_oracle_attaches_children_as_the_last_column() {
+        let spec = JoinSpec {
+            child_table: 8,
+            child_pk: 0,
+            parent_key: 0,
+            child_fk: 1,
+            child_filters: Vec::new(),
+            order: vec![(1, Dir::Asc)],
+            limit: 1,
+            slack: 0,
+        };
+        let plan = Reference::new(7, 0, vec![Stage::Join(spec)]);
+        let tables = Tables::new()
+            .with(7, rel(&[(1, 10)]))
+            // Children of parent 1: `[id, fk]` = (5, 1) and (6, 1).
+            .with(8, rel(&[(5, 1), (6, 1), (9, 2)]));
+
+        let out = plan.eval(&tables);
+        let row = out.get(&RowKey::from(1)).expect("parent survives the join");
+        assert_eq!(
+            row.get(2),
+            &Value::rows(vec![Row::new(vec![Value::Int(5), Value::Int(1)])]),
+            "one child, the lowest-sorting of the two that match"
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "last stage")]
+    fn a_join_may_not_have_stages_above_it() {
+        Reference::new(
+            7,
+            0,
+            vec![
+                Stage::Join(JoinSpec {
+                    child_table: 8,
+                    child_pk: 0,
+                    parent_key: 0,
+                    child_fk: 1,
+                    child_filters: Vec::new(),
+                    order: vec![(1, Dir::Asc)],
+                    limit: 1,
+                    slack: 0,
+                }),
+                Stage::TopK {
+                    order: vec![(1, Dir::Asc)],
+                    k: 1,
+                    slack: 0,
+                },
+            ],
         );
     }
 
@@ -436,9 +633,8 @@ mod tests {
         )
         .with_params(Params::new(vec![Value::Int(20)]));
 
-        let base = rel(&[(1, 10), (2, 20), (3, 30), (4, 40)]);
-        let mut store = MemStore::new();
-        store.load(7, base.clone());
+        let base = Tables::new().with(7, rel(&[(1, 10), (2, 20), (3, 30), (4, 40)]));
+        let mut store = MemStore::over(&base);
 
         let mut graph = plan.build();
         graph.hydrate(&mut store);

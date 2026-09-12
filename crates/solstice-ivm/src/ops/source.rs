@@ -39,6 +39,9 @@ pub struct Source {
     /// for a query that opted in via `allow_unbounded` (plan §1.2).
     limit: Option<usize>,
     pk: ColId,
+    /// When true, [`Operator::hydrate`] yields nothing and the source only ever
+    /// forwards deltas. See [`Source::deltas_only`].
+    deltas_only: bool,
 }
 
 impl Source {
@@ -50,7 +53,25 @@ impl Source {
             order: Vec::new(),
             limit: None,
             pk,
+            deltas_only: false,
         }
+    }
+
+    /// Hydrate to nothing; only forward this table's deltas.
+    ///
+    /// This is how the child side of a `Join` is wired. A join's child table is
+    /// the big one — a million comments behind a hundred thousand issues — and
+    /// hydrating it would materialise the entire table just so the join could
+    /// throw away all but three rows per parent. Instead the join hydrates
+    /// children *per parent*, with the parent's key pushed down, which is a
+    /// bounded read (plan §1.1: `limit` is mandatory on 1:N).
+    ///
+    /// The source still has to exist, because deltas to the child table must
+    /// reach the join after hydration. It is the hydration path alone that is
+    /// suppressed.
+    pub fn deltas_only(mut self) -> Self {
+        self.deltas_only = true;
+        self
     }
 
     pub fn with_pushdown(mut self, pred: Predicate, params: Params) -> Self {
@@ -84,6 +105,10 @@ impl Operator for Source {
     }
 
     fn hydrate(&mut self, cx: &mut dyn OpCx) -> Batch {
+        if self.deltas_only {
+            return Batch::new();
+        }
+
         let order = if self.order.is_empty() {
             // Scan in primary-key order by default. An unordered scan would be
             // marginally cheaper but would make hydration output depend on

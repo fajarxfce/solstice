@@ -4,6 +4,9 @@ on:
   push:
     branches: [main]
   pull_request:
+  schedule:
+    # 02:00 UTC daily, for the property sweep.
+    - cron: "0 2 * * *"
 
 env:
   CARGO_TERM_COLOR: always
@@ -21,6 +24,29 @@ jobs:
       - run: cargo fmt --all --check
       - run: cargo clippy --workspace --all-targets
       - run: cargo test --workspace
+
+  sweep:
+    # The delta law at depth, nightly.
+    #
+    # Plan §6 asks for thousands of cases per commit and millions overnight,
+    # and the two halves are not the same test: the per-commit run finds
+    # anything shallow, while the shapes that actually break incremental
+    # maintenance — a re-key racing a refill, a window emptied and refilled in
+    # one pump — need a lot of draws before proptest builds one. Running this
+    # on a schedule rather than per-PR keeps that depth affordable.
+    #
+    # A failure here prints its seed; paste it into `PROPTEST_CASES=1` with the
+    # regression file to replay it exactly.
+    if: github.event_name == 'schedule'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Property sweep
+        env:
+          PROPTEST_CASES: "1000000"
+        run: cargo test --release -p solstice-ivm --test delta_law
 
   determinism:
     # Five lines of grep protecting the one property everything else rests on.

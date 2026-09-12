@@ -47,7 +47,7 @@ pub use graph::{Graph, GraphBuilder, NodeId};
 pub use operator::{Degrade, Inputs, NoCx, OpCx, Operator, Port, ScanRequest};
 pub use order::{Cursor, Dir};
 pub use predicate::{CmpOp, Expr, Params, Predicate, Tri};
-pub use reference::{Reference, Stage};
+pub use reference::{JoinSpec, Reference, Stage, Tables};
 pub use relation::Relation;
 pub use schema::{Column, Schema, TableId, ValueType};
 pub use value::{ColId, Row, RowKey, Value};

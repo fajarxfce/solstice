@@ -145,6 +145,15 @@ impl TopK {
         self.slack
     }
 
+    /// The rows currently in the view, in sort order.
+    ///
+    /// `Join` uses this to materialise a parent's child collection. Cloning is
+    /// cheap — a `Row` is an `Arc` over its values — and the result is bounded
+    /// by `k`, so this stays proportional to what is on screen.
+    pub fn visible_rows(&self) -> Vec<Row> {
+        self.visible().iter().map(|e| e.row.clone()).collect()
+    }
+
     fn capacity(&self) -> usize {
         self.k + self.slack
     }

@@ -25,8 +25,9 @@ use std::cmp::Ordering;
 use std::hash::{Hash, Hasher};
 use std::sync::Arc;
 
-/// A scalar value. Mirrors SQLite's storage classes — deliberately, since
-/// SQLite is the durable store and we want a lossless round trip.
+/// A scalar value. The first five variants mirror SQLite's storage classes —
+/// deliberately, since SQLite is the durable store and we want a lossless round
+/// trip. [`Value::Rows`] is the one that does not, and it says so.
 #[derive(Debug, Clone)]
 pub enum Value {
     Null,
@@ -34,6 +35,33 @@ pub enum Value {
     Real(f64),
     Text(Arc<str>),
     Blob(Arc<[u8]>),
+    /// An ordered collection of child rows — the result of traversing a
+    /// declared relationship.
+    ///
+    /// # This one can never be stored
+    ///
+    /// It exists only *downstream of a `Join`*. Nothing writes it to SQLite,
+    /// nothing reads it from SQLite, and no predicate can be written against it
+    /// in DQL. Adding a variant to a type that otherwise mirrors storage classes
+    /// is a real cost, paid for one reason: DQL results are **hierarchical, not
+    /// flat** (plan §1.1), and the delta a join emits when a child changes is an
+    /// *update to the parent row* (plan §1.3). For that to be expressible, the
+    /// children have to live in a column of the parent.
+    ///
+    /// # What hierarchy buys, beyond the API
+    ///
+    /// A flat join multiplies rows: one parent with three comments becomes three
+    /// result rows. A `TopK` above it would then be limiting *comment* rows, so
+    /// it could not be pushed below the join — and a `TopK` above a join is
+    /// exactly the configuration plan §7 names as the project's most likely
+    /// technical failure, because refilling the window means asking the join for
+    /// children of parents it is not holding.
+    ///
+    /// Hierarchical output leaves parent cardinality unchanged, so `TopK`
+    /// commutes with the join and can run *below* it. The join then only ever
+    /// holds children for the `k + slack` parents in the window. The memory
+    /// bound is a consequence of this variant existing.
+    Rows(Arc<[Row]>),
 }
 
 impl Value {
@@ -43,6 +71,10 @@ impl Value {
 
     pub fn blob(b: impl AsRef<[u8]>) -> Self {
         Value::Blob(Arc::from(b.as_ref()))
+    }
+
+    pub fn rows(rows: impl Into<Arc<[Row]>>) -> Self {
+        Value::Rows(rows.into())
     }
 
     pub fn is_null(&self) -> bool {
@@ -60,6 +92,10 @@ impl Value {
             Value::Null | Value::Int(_) | Value::Real(_) => 0,
             Value::Text(s) => s.len(),
             Value::Blob(b) => b.len(),
+            Value::Rows(rows) => {
+                rows.len() * std::mem::size_of::<Row>()
+                    + rows.iter().map(Row::heap_bytes).sum::<usize>()
+            }
         }
     }
 
@@ -71,6 +107,9 @@ impl Value {
             Value::Int(_) | Value::Real(_) => 1,
             Value::Text(_) => 2,
             Value::Blob(_) => 3,
+            // Unreachable from `sql_cmp`, which rejects `Rows` before getting
+            // here. Ranked anyway so the function stays total.
+            Value::Rows(_) => 4,
         }
     }
 
@@ -83,6 +122,7 @@ impl Value {
             Value::Real(_) => 2,
             Value::Text(_) => 3,
             Value::Blob(_) => 4,
+            Value::Rows(_) => 5,
         }
     }
 
@@ -92,8 +132,17 @@ impl Value {
     /// Returns `None` if either side is `NULL`, which callers must propagate as
     /// SQL "unknown" rather than collapsing to false too early — `NOT (x > 1)`
     /// is unknown, not true, when `x` is NULL.
+    ///
+    /// It also returns `None` for [`Value::Rows`]: a child collection is not a
+    /// SQL value, so comparing one is unknown rather than false. DQL rejects
+    /// such a predicate at compile time; this is the runtime backstop, and
+    /// unknown is the safe side to fail to — a row whose comparison is unknown
+    /// drops out of the view instead of ordering by some invented rule.
     pub fn sql_cmp(&self, other: &Value) -> Option<Ordering> {
         if self.is_null() || other.is_null() {
+            return None;
+        }
+        if matches!(self, Value::Rows(_)) || matches!(other, Value::Rows(_)) {
             return None;
         }
         match (self, other) {
@@ -180,6 +229,10 @@ impl Ord for Value {
             (Value::Real(a), Value::Real(b)) => total_cmp_f64(*a, *b),
             (Value::Text(a), Value::Text(b)) => a.as_bytes().cmp(b.as_bytes()),
             (Value::Blob(a), Value::Blob(b)) => a[..].cmp(&b[..]),
+            // Child collections compare element-wise, which is what makes a
+            // parent row whose children changed compare unequal to its old
+            // image — and therefore what makes the join emit an update.
+            (Value::Rows(a), Value::Rows(b)) => a[..].cmp(&b[..]),
             _ => self.struct_rank().cmp(&other.struct_rank()),
         }
     }
@@ -195,6 +248,7 @@ impl Hash for Value {
             Value::Real(v) => v.to_bits().hash(state),
             Value::Text(v) => v.as_bytes().hash(state),
             Value::Blob(v) => v[..].hash(state),
+            Value::Rows(v) => v[..].hash(state),
         }
     }
 }
@@ -236,7 +290,7 @@ pub type ColId = u16;
 ///
 /// Cheap to clone (`Arc` over the value slice), which matters because deltas
 /// carry both the before and after image of every changed row.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct Row {
     values: Arc<[Value]>,
 }
@@ -271,6 +325,19 @@ impl Row {
     pub fn heap_bytes(&self) -> usize {
         self.values.len() * std::mem::size_of::<Value>()
             + self.values.iter().map(Value::heap_bytes).sum::<usize>()
+    }
+
+    /// The same row with one more column on the end.
+    ///
+    /// How a `Join` attaches its children: the child collection becomes the
+    /// parent's last column, at a position the planner knows statically. A join
+    /// therefore only ever *widens* a row, never reorders it, so column ids
+    /// assigned upstream stay valid downstream.
+    pub fn with_appended(&self, value: Value) -> Row {
+        let mut values = Vec::with_capacity(self.values.len() + 1);
+        values.extend(self.values.iter().cloned());
+        values.push(value);
+        Row::new(values)
     }
 
     /// Project onto a subset of columns, preserving the given order.
@@ -424,5 +491,44 @@ mod tests {
     fn row_get_out_of_range_is_null() {
         let r = Row::new(vec![Value::Int(1)]);
         assert!(r.get(7).is_null());
+    }
+
+    #[test]
+    fn a_child_collection_is_not_sql_comparable() {
+        // Unknown, not false and not "ranks above blob". A DQL query can never
+        // ask this, so the only job here is to fail to the safe side.
+        let children = Value::rows(vec![Row::new(vec![Value::Int(1)])]);
+        assert_eq!(children.sql_cmp(&Value::Int(1)), None);
+        assert_eq!(Value::Int(1).sql_cmp(&children), None);
+        assert_eq!(children.sql_cmp(&children), None);
+        assert!(!children.is_null());
+    }
+
+    /// Structural equality still has to work, or a join could never tell that a
+    /// parent's children changed.
+    #[test]
+    fn child_collections_compare_element_wise() {
+        let one = Value::rows(vec![Row::new(vec![Value::Int(1)])]);
+        let same = Value::rows(vec![Row::new(vec![Value::Int(1)])]);
+        let other = Value::rows(vec![Row::new(vec![Value::Int(2)])]);
+        let longer = Value::rows(vec![
+            Row::new(vec![Value::Int(1)]),
+            Row::new(vec![Value::Int(9)]),
+        ]);
+
+        assert_eq!(one, same);
+        assert_ne!(one, other);
+        assert_ne!(one, longer);
+        assert!(one < longer, "a prefix orders before its extension");
+        assert_eq!(Value::rows(Vec::new()), Value::rows(Vec::new()));
+    }
+
+    #[test]
+    fn appending_widens_a_row_without_disturbing_it() {
+        let r = Row::new(vec![Value::Int(1), Value::text("a")]);
+        let wide = r.with_appended(Value::rows(Vec::new()));
+        assert_eq!(wide.get(0), &Value::Int(1));
+        assert_eq!(wide.get(1), &Value::text("a"));
+        assert_eq!(wide.len(), 3);
     }
 }
