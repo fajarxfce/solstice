@@ -34,6 +34,12 @@ already fatal at this budget, and a phone will not be kinder.
 matters more than it first looks: the steady state of a running app is deltas.
 The 5ms budget is about the *first* frame after a subscribe.
 
+**The failure has a fix, and the fix is measured, not assumed** — the plan named
+it in advance and half of it turns out to be enough. A prototype of generated
+zero-copy accessors does the same job in **8.30µs**, and reading all 1000 rows
+through it is still 8× cheaper than decoding them eagerly. Details below; the
+short version is that the `.proto` does not change.
+
 ## The diagnosis
 
 A FAIL is not yet a finding. The plan's fallback is a large piece of work, and it
@@ -69,28 +75,81 @@ correctness loss, since SQLite integers are 64-bit — in exchange for nothing.
 **93% of the time is building objects, not reading bytes.** Dart walks this
 payload at roughly 630 MB/s. The encoding is not the problem.
 
-## What this means for the plan
+## The fallback, measured rather than assumed
 
-Plan §4.1's fallback has two separable halves, and the measurement says which one
-is load-bearing:
+Plan §4.1's fallback has two separable halves, and the diagnosis says only one is
+load-bearing: **zero-copy accessors, without the columnar re-encoding.**
 
-- **Zero-copy accessors — needed.** This is the whole failure. Decode on demand,
-  in `itemBuilder`, for the rows actually being painted.
-- **Columnar encoding — not needed.** Indexing the *existing* row-oriented payload
-  already lands at 8µs, three orders of magnitude inside the budget. Reordering
-  the bytes would be solving a problem that does not exist, and it would cost the
-  property that makes the byte ABI worth having: one encoding shared with the wire
-  protocol.
+`lazy_view.dart` is that half, prototyped — hand-written, but written as a
+prototype of what codegen would emit, with the column indices baked in because a
+generator knows the query's shape. Run it with `./dart/run.sh lazy`:
 
-So the `.proto` survives S1 unchanged, and the work moves to the Dart binding.
-Kotlin needs nothing — javalite is inside budget as it stands, and the same lazy
-accessor can follow later if ART says otherwise.
+| what the host does | best | vs 5ms budget |
+|---|---|---|
+| eager decode, whole view (`package:protobuf`) | 8.17ms | **FAIL** |
+| lazy: index only — what `subscribe()` returns | **8.30µs** | PASS, 600× under |
+| lazy: index + 12 tiles (id, title, priority, closed) | 10.50µs | PASS |
+| lazy: index + 12 tiles, comments included | 20.55µs | PASS |
+| lazy: index + **all 1000** rows, comments included | **984µs** | PASS |
 
-The honest caveat: a 5ms budget against a 6.14ms measurement is not a rout, and a
-reader could reasonably ask whether tuning `package:protobuf` would close it. Two
-reasons not to bother. The p50 is 9.91ms, not 6.14ms, so the typical frame is
-2× over, not 20%. And the budget is a laptop standing in for a phone — the device
-gate in plan §9 is still ahead, and it only moves one direction.
+Three things worth reading off that table.
+
+**The first frame stops being a problem.** What `subscribe()` has to return before
+the first paint is the index: 8.30µs. The kill criterion is no longer close.
+
+**One screen is free.** A dozen tiles with their comments is 20.55µs, inside a
+16ms frame by three orders of magnitude, which leaves the budget to layout and
+raster where it belongs.
+
+**Laziness is not just moving the cost.** That was the real risk — a good first
+frame paid for with a bad fling. Reading *all* 1000 rows and every comment through
+the accessor costs 984µs, **8× less than decoding them eagerly**, because it never
+builds the 28,000 intermediate messages. There is no scroll position that makes
+the eager decoder the better choice.
+
+<sub>The eager row reads 8.17ms here against 6.14ms in `bench.dart`. Same bytes,
+different harness: this one times batches of 20 consecutive decodes, so the
+allocator pressure from one lands inside the next, where `bench.dart` measures an
+isolated best case. The batched figure is the more honest one for a scrolling
+list, and both fail. The comparison that matters is within one harness: 8.17ms
+against 8.30µs.</sub>
+
+So the `.proto` survives S1 unchanged, the columnar half of the fallback is not
+needed, and the work moves to the Dart binding. Kotlin needs nothing — javalite is
+inside budget as it stands, and the same accessor can follow if ART says
+otherwise.
+
+The honest caveat: 6.14ms against a 5ms budget is not a rout, and a reader could
+reasonably ask whether tuning `package:protobuf` would close it. Two reasons not
+to bother. Its p50 is 9.91ms, so the typical frame is 2× over, not 20%. And the
+budget is a laptop standing in for a phone — plan §9's device gate is still ahead
+and only moves one direction.
+
+## A correctness finding, not a performance one
+
+`package:protobuf` 6.1.0 **decodes `sint64` wrongly at the extremes of the
+type.** It reports `i64::MIN` as `0` and `i64::MAX` as `-1`, and the bits are
+wrong, not the formatting — `toHexString()` gives `FFFFFFFFFFFFFFFF`.
+
+`zigzag(i64::MIN)` is `u64::MAX`, the only value that needs all ten varint bytes,
+and un-zigzagging it needs a *logical* right shift where an arithmetic one
+collapses the result. This accessor made the same mistake on its first draft.
+What caught both is `edge.bin` — four rows the hydration will never produce, which
+is exactly why they had to be generated rather than found: the 1000-row window
+holds the top issues by priority, so it contains no NULL, no empty child
+collection, no empty string and no large integer. Its cross-check line reads
+`0 nulls`, and a decoder that mishandled every one of those cases would pass it.
+
+Three independent decoders — Rust, `protoc`-generated Java on protobuf-javalite,
+and this accessor — agree on the correct values, so it is not the encoder.
+
+It matters past the spike. A SQLite column holds an `i64`, so these are values a
+real row may legitimately carry, and the failure is silent: a corrupted number,
+not an exception. It is an argument for the generated accessor that has nothing to
+do with speed, and it is worth reporting upstream.
+
+The check is live rather than a comment — if `package:protobuf` fixes this, the
+spike will say so instead of going on warning about it.
 
 ## Reproducing
 
@@ -104,7 +163,8 @@ cargo run --release -p solstice-bench --bin s1-fixture
 
 # 3. Run them.
 ./dart/run.sh          # AOT-compiled, which is what Flutter ships
-./dart/run.sh probe    # the diagnosis above
+./dart/run.sh probe    # the diagnosis: boxing, the walk, the index
+./dart/run.sh lazy     # the fallback, and the package:protobuf finding
 ./kotlin/run.sh        # needs kotlinc; found inside Android Studio or IDEA
 ```
 
@@ -144,5 +204,19 @@ drifts from the spec fails these runs with exit code 1.
 | `generate.sh` | `protoc` → Dart and Java (javalite, because Android ships lite) |
 | `dart/bin/bench.dart` | the budget measurement + cross-check assertion |
 | `dart/bin/probe.dart` | the diagnosis: boxing, the allocation-free walk, the index |
-| `kotlin/Bench.kt` | same, on the JVM |
+| `dart/lib/lazy_view.dart` | the fallback: a prototype of generated zero-copy accessors |
+| `dart/bin/lazy.dart` | does the fallback work, and every field verified both ways |
+| `kotlin/Bench.kt` | same budget measurement on the JVM, plus the edge fixture |
 | `kotlin/run.sh` | no Gradle — one Kotlin file and generated Java do not need one |
+
+## What S1 does not settle
+
+- **It ran on a laptop.** Kotlin's pass is HotSpot, not ART; Dart's AOT is x86-64,
+  not arm64. Plan §9's device gate is still the real one.
+- **Nothing has crossed FFI.** This measures decode, not the round trip. The copy
+  `flutter_rust_bridge` and UniFFI make at the boundary is unmeasured, and it is
+  the next thing to build.
+- **The accessor is a prototype, not a generator.** It is hand-written against one
+  query's shape. Turning it into codegen driven by the query IR is M1 work, and
+  the interesting part — strings, nested collections, NULL — is what this file
+  already had to solve.

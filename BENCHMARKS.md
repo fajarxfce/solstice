@@ -84,7 +84,8 @@ right one.
 | Peak anonymous RSS | < 60MB | **6.3 MB** | PASS |
 | `TopK` refills/sec at 200 rows/sec | < 5 | **1.4** | PASS |
 | Decode of a 1000-row view — Kotlin | < 5ms | **1.65ms** | PASS |
-| Decode of a 1000-row view — Dart | < 5ms | **6.14ms** | **FAIL** |
+| Decode of a 1000-row view — Dart, `package:protobuf` | < 5ms | **6.14ms** | **FAIL** |
+| Decode of a 1000-row view — Dart, zero-copy accessor | < 5ms | **8.30µs** | PASS |
 | APK size per ABI | < 8MB | not yet measured | — |
 
 Peak *total* RSS is 68.2 MB, of which 61.9 MB is SQLite's reclaimable `mmap`
@@ -204,8 +205,31 @@ So plan §4.1's named fallback is right, and the measurement narrows it to half:
 bytes that already index in 8µs would solve nothing and would cost the shared
 encoding with the wire protocol. The `.proto` survives S1 unchanged.
 
+That fallback is then built and measured rather than taken on faith, because the
+real risk in going lazy is trading a good first frame for a bad fling:
+
+| what the host does | best |
+|---|---|
+| eager decode, whole view | 8.17ms |
+| lazy: index only — what `subscribe()` returns | **8.30µs** |
+| lazy: index + 12 tiles, comments included | 20.55µs |
+| lazy: index + all 1000 rows, comments included | **984µs** |
+
+Reading *everything* through the accessor is 8× cheaper than decoding it eagerly,
+so there is no scroll position at which the eager decoder wins. <sub>The eager row
+reads 8.17ms here against 6.14ms above because this harness times batches of 20
+consecutive decodes, so one decode's allocator pressure lands inside the next.
+Both fail; the comparison that matters is within one harness.</sub>
+
 Kotlin is measured on HotSpot; Compose runs on ART. That pass is provisional in
 the same way every number here is.
+
+**A correctness finding fell out of it.** `package:protobuf` 6.1.0 decodes
+`sint64` wrongly at the extremes of the type — `i64::MIN` reads back as `0` and
+`i64::MAX` as `-1`, wrong bits rather than wrong formatting. Rust, generated Java
+and the accessor all agree on the correct values. A SQLite column holds an `i64`,
+so a real row may carry these, and the failure is silent. Details and the
+reproduction in [`spikes/s1-decode/`](spikes/s1-decode/).
 
 ## What this does not yet prove
 

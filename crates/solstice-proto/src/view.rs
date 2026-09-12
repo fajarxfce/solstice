@@ -289,6 +289,27 @@ mod tests {
         ViewDelta::decode(&d.encode()).expect("decodes")
     }
 
+    /// The two values that need all ten varint bytes.
+    ///
+    /// `i64::MIN` zigzags to `u64::MAX` and `i64::MAX` to `u64::MAX - 1`, which
+    /// makes them the only inputs that exercise the tenth byte and the only ones
+    /// where un-zigzagging with an arithmetic shift instead of a logical one
+    /// gives the wrong answer rather than a close one. A SQLite column holds
+    /// `i64`, so these are in range for a real row, not hypothetical.
+    #[test]
+    fn the_extremes_of_i64_survive() {
+        let d = delta(vec![ViewChange::Added {
+            index: 0,
+            row: Row::new(vec![
+                Value::Int(i64::MIN),
+                Value::Int(i64::MAX),
+                Value::Int(-1),
+                Value::Int(0),
+            ]),
+        }]);
+        assert_eq!(round_trip(&d), d);
+    }
+
     #[test]
     fn every_change_kind_survives_the_round_trip() {
         let d = delta(vec![

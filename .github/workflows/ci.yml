@@ -136,6 +136,14 @@ jobs:
       - name: Rust encoder vs. generated Dart decoder
         run: ./spikes/s1-decode/dart/run.sh
 
+      # Two oracles again, and deliberately different ones. Against the 1000-row
+      # view the accessor is checked field by field on every row against the
+      # generated decoder; against `edge.bin` it is checked against what Rust
+      # encoded, because on the extremes of `i64` the generated decoder is the
+      # one that is wrong.
+      - name: Zero-copy accessor vs. both
+        run: ./spikes/s1-decode/dart/run.sh lazy
+
   determinism:
     # Five lines of grep protecting the one property everything else rests on.
     #

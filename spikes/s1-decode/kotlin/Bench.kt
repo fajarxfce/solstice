@@ -41,6 +41,42 @@ fun main(args: Array<String>) {
 
     println()
     crossCheck(view)
+    edgeCheck(read("$dir/edge.bin"))
+}
+
+/// The tie-breaker.
+///
+/// `edge.bin` carries values a real hydration never produces but a real row is
+/// allowed to hold — including `i64::MIN` and `i64::MAX`, the only two values
+/// whose zigzag encoding needs all ten varint bytes. Rust round-trips them and
+/// the Dart accessor in `lazy_view.dart` agrees; `package:protobuf` reports 0
+/// and -1. Two against one is not an argument, so this is the third opinion,
+/// from a decoder written by neither party.
+fun edgeCheck(bytes: ByteArray) {
+    val rows = ViewDelta.parseFrom(bytes).changesList.map { it.added.row }
+    val failures = buildList {
+        if (rows.size != 4) add("expected 4 rows, got ${rows.size}")
+        if (rows[0].getValues(2).kindCase != Value.KindCase.KIND_NOT_SET) {
+            add("row 0 priority should be NULL (the unset oneof)")
+        }
+        if (rows[1].getValues(2).kindCase != Value.KindCase.INTEGER) {
+            add("row 1 priority is Int(0) and must still carry its tag")
+        }
+        if (rows[2].getValues(2).integer != Long.MIN_VALUE) {
+            add("row 2 priority: ${rows[2].getValues(2).integer} != Long.MIN_VALUE")
+        }
+        if (rows[2].getValues(5).integer != Long.MAX_VALUE) {
+            add("row 2 updated_at: ${rows[2].getValues(5).integer} != Long.MAX_VALUE")
+        }
+        if (rows[3].getValues(4).text != "judul — panjang ünïcödé ✓") {
+            add("row 3 title: multi-byte UTF-8 did not survive")
+        }
+    }
+    if (failures.isNotEmpty()) {
+        System.err.println("edge-check FAILED — ${failures.joinToString("; ")}")
+        exitProcess(1)
+    }
+    println("edge-check: NULL, Int(0), i64 extremes and multi-byte UTF-8 all survive")
 }
 
 fun read(path: String): ByteArray {

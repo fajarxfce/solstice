@@ -7,7 +7,7 @@
 //! a real hydration of plan §7's query with the window widened to 1000, and
 //! encodes whatever came out.
 //!
-//! Two files land in the output directory:
+//! Three files land in the output directory:
 //!
 //! * `view-1000.bin` — the initial view: 1000 `Added`, each a joined issue row
 //!   carrying its three latest comments as a nested collection.
@@ -16,6 +16,8 @@
 //!   whole parent plus its children, where a realistic mix would be mostly
 //!   `Changed` and `Moved`. A budget is worth more when it is set against the
 //!   bad case.
+//! * `edge.bin` — four rows a real hydration will never produce, for the host
+//!   accessors to be checked against rather than timed on. See [`edges`].
 //!
 //! It also prints the Rust-side encode and decode cost. That is the control
 //! number: without it a Dart figure is unanchored, and "slow" cannot be
@@ -155,8 +157,14 @@ fn run(out: &PathBuf) -> Result<(), Box<dyn std::error::Error>> {
     println!("| file | changes | scalars | bytes | bytes/row |");
     println!("|---|---|---|---|---|");
 
+    let edges = edges();
+
     std::fs::create_dir_all(out)?;
-    for (name, delta) in [("view-1000.bin", &full), ("delta-5.bin", &small)] {
+    for (name, delta) in [
+        ("view-1000.bin", &full),
+        ("delta-5.bin", &small),
+        ("edge.bin", &edges),
+    ] {
         let encoded = delta.encode();
         let path = out.join(name);
         std::fs::write(&path, &encoded)?;
@@ -176,6 +184,95 @@ fn run(out: &PathBuf) -> Result<(), Box<dyn std::error::Error>> {
     control(&small, "delta-5");
 
     Ok(())
+}
+
+/// Rows the hydration will never produce, which is exactly why they are needed.
+///
+/// The 1000-row view is real traffic, and that is what makes it the right thing
+/// to *measure* — and the wrong thing to test edges against. The window holds
+/// the top 1000 issues by priority, so every row in it has a priority and the
+/// NULL path is never taken; the join found three comments for every parent, so
+/// the empty-collection path is never taken either. The cross-check reports
+/// `0 nulls`, and a host accessor that mishandled NULL would pass it.
+///
+/// These rows are in the issue shape on purpose. A host accessor is generated
+/// per query, so a fixture in some other shape would exercise a decoder nobody
+/// has.
+///
+/// | # | what it catches |
+/// |---|---|
+/// | 0 | NULL as the unset oneof, and an empty child collection |
+/// | 1 | a zero that must still write its tag, and an empty string |
+/// | 2 | negatives and 10-byte varints — zigzag at both extremes |
+/// | 3 | multi-byte UTF-8, and a child whose text field is empty |
+fn edges() -> ViewDelta {
+    use solstice_ivm::Row;
+
+    let issue = |id: i64,
+                 project: i64,
+                 priority: Value,
+                 closed: i64,
+                 title: &str,
+                 updated: i64,
+                 comments: Vec<Row>| {
+        ViewChange::Added {
+            index: 0,
+            row: Row::new(vec![
+                Value::Int(id),
+                Value::Int(project),
+                priority,
+                Value::Int(closed),
+                Value::text(title),
+                Value::Int(updated),
+                Value::rows(comments),
+            ]),
+        }
+    };
+    let comment = |id: i64, issue_id: i64, created: i64, author: &str, body: &str| {
+        Row::new(vec![
+            Value::Int(id),
+            Value::Int(issue_id),
+            Value::Int(created),
+            Value::text(author),
+            Value::text(body),
+        ])
+    };
+
+    ViewDelta {
+        sub_id: 7,
+        version: 3,
+        changes: vec![
+            issue(1, 1, Value::Null, 0, "no priority, no comments", 0, vec![]),
+            issue(0, 0, Value::Int(0), 0, "", 0, vec![]),
+            // `i64::MIN` zigzags to `u64::MAX`, the only value that needs all ten
+            // varint bytes — and the one that catches a host using an arithmetic
+            // right shift to un-zigzag where it needs a logical one.
+            issue(
+                -1,
+                -2_000_000,
+                Value::Int(i64::MIN),
+                1,
+                "negative and huge",
+                i64::MAX,
+                vec![],
+            ),
+            issue(
+                9_007_199_254_740_993,
+                3,
+                Value::Int(999),
+                0,
+                "judul — panjang ünïcödé ✓",
+                1,
+                vec![comment(
+                    1,
+                    9_007_199_254_740_993,
+                    0,
+                    "",
+                    "emoji: 🌒 solstice",
+                )],
+            ),
+        ],
+    }
 }
 
 /// The Rust-side cost of the same work the hosts are about to do.
