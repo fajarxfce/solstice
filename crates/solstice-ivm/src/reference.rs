@@ -8,144 +8,106 @@
 //! evaluator over `Vec<Row>`, SQLite itself via `IR → SQL`, and the incremental
 //! path. Oracle (b) arrives with `solstice-store`.
 
-use crate::delta::{Batch, Change};
-use crate::operator::{Dir, OpCx, Operator, ScanRequest};
-use crate::ops::{Filter, Project};
+use crate::operator::{OpCx, Operator, Pipeline, ScanRequest};
+use crate::ops::{Filter, Project, TopK};
+use crate::order::{cmp_entry, cmp_to_cursor, Dir};
 use crate::predicate::{Params, Predicate};
-use crate::value::{ColId, Row, RowKey, Value};
+use crate::relation::Relation;
+use crate::schema::TableId;
+use crate::value::{ColId, Row, RowKey};
 use std::collections::BTreeMap;
-
-/// A keyed set of rows.
-///
-/// `BTreeMap` rather than `HashMap`: iteration order must be deterministic,
-/// which `solstice-ivm` requires structurally (plan §6).
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct Relation {
-    rows: BTreeMap<RowKey, Row>,
-}
-
-impl Relation {
-    pub fn new() -> Self {
-        Relation::default()
-    }
-
-    pub fn len(&self) -> usize {
-        self.rows.len()
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.rows.is_empty()
-    }
-
-    pub fn get(&self, key: &RowKey) -> Option<&Row> {
-        self.rows.get(key)
-    }
-
-    pub fn insert(&mut self, key: RowKey, row: Row) {
-        self.rows.insert(key, row);
-    }
-
-    pub fn remove(&mut self, key: &RowKey) -> Option<Row> {
-        self.rows.remove(key)
-    }
-
-    pub fn iter(&self) -> impl Iterator<Item = (&RowKey, &Row)> {
-        self.rows.iter()
-    }
-
-    /// Apply a batch. Written to tolerate ill-formed batches — an insert over
-    /// an existing key, a delete of an absent key — because the property tests
-    /// deliberately generate adversarial input and a panic here would be an
-    /// oracle failure rather than a finding.
-    pub fn apply(&mut self, batch: &Batch) {
-        for change in batch.iter() {
-            match change.after() {
-                Some(row) => {
-                    self.rows.insert(change.key().clone(), row.clone());
-                }
-                None => {
-                    self.rows.remove(change.key());
-                }
-            }
-        }
-    }
-
-    pub fn with_applied(&self, batch: &Batch) -> Relation {
-        let mut out = self.clone();
-        out.apply(batch);
-        out
-    }
-
-    /// The batch that turns `self` into `other`.
-    ///
-    /// This is what a `Requery` node emits after re-executing its subtree
-    /// (plan §1.5), and what makes degradation semantically identical to the
-    /// incremental path rather than merely similar.
-    pub fn diff(&self, other: &Relation) -> Batch {
-        let mut batch = Batch::new();
-        for (key, before) in &self.rows {
-            if let Some(change) = Change::from_images(
-                key.clone(),
-                Some(before.clone()),
-                other.rows.get(key).cloned(),
-            ) {
-                batch.push(change);
-            }
-        }
-        for (key, after) in &other.rows {
-            if !self.rows.contains_key(key) {
-                batch.push(Change::Insert {
-                    key: key.clone(),
-                    row: after.clone(),
-                });
-            }
-        }
-        batch
-    }
-}
-
-impl FromIterator<(RowKey, Row)> for Relation {
-    fn from_iter<T: IntoIterator<Item = (RowKey, Row)>>(iter: T) -> Self {
-        Relation {
-            rows: iter.into_iter().collect(),
-        }
-    }
-}
 
 /// One step of a reference plan, mirroring one operator.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Stage {
-    Filter { pred: Predicate, params: Params },
-    Project { cols: Vec<ColId> },
-}
-
-impl Stage {
-    /// The incremental operator this stage corresponds to.
-    ///
-    /// Having both sides built from one description is what makes the delta law
-    /// testable: there is no chance of the oracle and the pipeline being handed
-    /// subtly different queries.
-    pub fn build(&self) -> Box<dyn Operator> {
-        match self {
-            Stage::Filter { pred, params } => Box::new(Filter::new(pred.clone(), params.clone())),
-            Stage::Project { cols } => Box::new(Project::new(cols.clone())),
-        }
-    }
+    Filter {
+        pred: Predicate,
+    },
+    Project {
+        cols: Vec<ColId>,
+    },
+    TopK {
+        table: TableId,
+        order: Vec<(ColId, Dir)>,
+        k: usize,
+        slack: usize,
+    },
 }
 
 /// A reference plan: stages applied in order, wholesale, over a whole relation.
+///
+/// Parameters are bound once per plan rather than per stage, because that is
+/// what a query is (plan §1.2: `ViewId = hash(IR with params)`). It also makes
+/// pushdown well-defined — a predicate can only be handed to a scan together
+/// with the bindings it was written against.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Reference {
     stages: Vec<Stage>,
+    params: Params,
 }
 
 impl Reference {
     pub fn new(stages: Vec<Stage>) -> Self {
-        Reference { stages }
+        Reference {
+            stages,
+            params: Params::empty(),
+        }
+    }
+
+    pub fn with_params(mut self, params: Params) -> Self {
+        self.params = params;
+        self
     }
 
     pub fn stages(&self) -> &[Stage] {
         &self.stages
+    }
+
+    pub fn params(&self) -> &Params {
+        &self.params
+    }
+
+    /// The incremental pipeline this plan corresponds to.
+    ///
+    /// Having both sides built from one description is what makes the delta law
+    /// testable: there is no chance of the oracle and the pipeline being handed
+    /// subtly different queries.
+    ///
+    /// The one piece of real optimiser behaviour here is **filter pushdown into
+    /// `TopK`**, and it is not an optimisation — it is required for
+    /// correctness. A `TopK` refills by reading the base table, so without the
+    /// upstream filters it would pull in rows the pipeline has already decided
+    /// are not part of the relation, and hand them to the view.
+    pub fn build(&self) -> Pipeline {
+        let mut seen_filters: Vec<Predicate> = Vec::new();
+        let mut ops: Vec<Box<dyn Operator>> = Vec::new();
+
+        for stage in &self.stages {
+            match stage {
+                Stage::Filter { pred } => {
+                    seen_filters.push(pred.clone());
+                    ops.push(Box::new(Filter::new(pred.clone(), self.params.clone())));
+                }
+                Stage::Project { cols } => ops.push(Box::new(Project::new(cols.clone()))),
+                Stage::TopK {
+                    table,
+                    order,
+                    k,
+                    slack,
+                } => {
+                    let mut top = TopK::new(*table, order.clone(), *k).with_slack(*slack);
+                    if !seen_filters.is_empty() {
+                        top = top.with_pushdown(
+                            Predicate::and(seen_filters.clone()),
+                            self.params.clone(),
+                        );
+                    }
+                    ops.push(Box::new(top));
+                }
+            }
+        }
+
+        Pipeline::new(ops)
     }
 
     /// Evaluate from scratch. O(relation) by construction, which is the point.
@@ -153,15 +115,25 @@ impl Reference {
         let mut current = input.clone();
         for stage in &self.stages {
             current = match stage {
-                Stage::Filter { pred, params } => current
+                Stage::Filter { pred } => current
                     .iter()
-                    .filter(|(_, row)| pred.matches(row, params))
+                    .filter(|(_, row)| pred.matches(row, &self.params))
                     .map(|(k, r)| (k.clone(), r.clone()))
                     .collect(),
                 Stage::Project { cols } => current
                     .iter()
                     .map(|(k, r)| (k.clone(), r.project(cols)))
                     .collect(),
+                Stage::TopK { order, k, .. } => {
+                    // Sort the whole thing and take the first k. Quadratically
+                    // dumber than the operator, which is exactly its job.
+                    let mut rows: Vec<(&RowKey, &Row)> = current.iter().collect();
+                    rows.sort_by(|a, b| cmp_entry(*a, *b, order));
+                    rows.into_iter()
+                        .take(*k)
+                        .map(|(key, row)| (key.clone(), row.clone()))
+                        .collect()
+                }
             };
         }
         current
@@ -173,7 +145,7 @@ impl Reference {
 /// Stands in for `solstice-store` so that `solstice-ivm` can be exercised end to end
 /// without SQLite — which is the whole reason the store is behind a trait.
 pub struct MemStore {
-    tables: BTreeMap<u16, Relation>,
+    tables: BTreeMap<TableId, Relation>,
     pub refills: usize,
     pub rows_refilled: usize,
 }
@@ -187,11 +159,11 @@ impl MemStore {
         }
     }
 
-    pub fn table(&mut self, table: u16) -> &mut Relation {
+    pub fn table(&mut self, table: TableId) -> &mut Relation {
         self.tables.entry(table).or_default()
     }
 
-    pub fn load(&mut self, table: u16, rel: Relation) {
+    pub fn load(&mut self, table: TableId, rel: Relation) {
         self.tables.insert(table, rel);
     }
 }
@@ -207,34 +179,22 @@ impl OpCx for MemStore {
         let Some(rel) = self.tables.get(&req.table) else {
             return Vec::new();
         };
-        let params = Params::empty();
 
         let mut rows: Vec<(RowKey, Row)> = rel
             .iter()
             .filter(|(_, row)| match &req.filter {
-                Some(p) => p.matches(row, &params),
+                Some(p) => p.matches(row, &req.params),
                 None => true,
             })
             .map(|(k, r)| (k.clone(), r.clone()))
             .collect();
 
-        rows.sort_by(|(ak, ar), (bk, br)| cmp_by_order(ar, br, &req.order).then(ak.cmp(bk)));
+        rows.sort_by(|(ak, ar), (bk, br)| cmp_entry((ak, ar), (bk, br), &req.order));
 
-        if let Some(after) = &req.after {
-            // Exclusive lower bound: skip everything up to and including the
-            // caller's last key. Linear here because this is the oracle; the
-            // real store seeks the index.
-            let probe = Row::new(after.clone());
-            let probe_cols: Vec<(ColId, Dir)> = req
-                .order
-                .iter()
-                .enumerate()
-                .map(|(i, (_, dir))| (i as ColId, *dir))
-                .collect();
-            rows.retain(|(_, r)| {
-                let key = project_order_key(r, &req.order);
-                cmp_by_order(&key, &probe, &probe_cols).is_gt()
-            });
+        if let Some(cursor) = &req.after {
+            // Exclusive lower bound. Linear here because this is the oracle;
+            // the real store seeks the index.
+            rows.retain(|(k, r)| cmp_to_cursor(k, r, cursor, &req.order).is_gt());
         }
 
         rows.truncate(req.limit);
@@ -247,46 +207,14 @@ impl OpCx for MemStore {
     }
 }
 
-fn project_order_key(row: &Row, order: &[(ColId, Dir)]) -> Row {
-    Row::new(
-        order
-            .iter()
-            .map(|(c, _)| row.get(*c).clone())
-            .collect::<Vec<Value>>(),
-    )
-}
-
-/// Compare two rows under an order spec, using SQL comparison so that results
-/// match the SQLite oracle. NULLs sort first, as SQLite does for `ASC`.
-///
-/// Ties are possible (`Int(1)` vs `Real(1.0)`), which is why every caller must
-/// break them with the primary key — the same reason a cursor carries the full
-/// sort key *and* the pk (plan §1.1).
-pub fn cmp_by_order(a: &Row, b: &Row, order: &[(ColId, Dir)]) -> std::cmp::Ordering {
-    use std::cmp::Ordering;
-    for (col, dir) in order {
-        let (x, y) = (a.get(*col), b.get(*col));
-        let ord = match (x.is_null(), y.is_null()) {
-            (true, true) => Ordering::Equal,
-            (true, false) => Ordering::Less,
-            (false, true) => Ordering::Greater,
-            (false, false) => x.sql_cmp(y).unwrap_or(Ordering::Equal),
-        };
-        let ord = match dir {
-            Dir::Asc => ord,
-            Dir::Desc => ord.reverse(),
-        };
-        if ord != Ordering::Equal {
-            return ord;
-        }
-    }
-    Ordering::Equal
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::delta::{Batch, Change};
     use crate::ops::Source;
+    use crate::order::Cursor;
+    use crate::predicate::{CmpOp, Expr};
+    use crate::value::Value;
 
     fn rel(rows: &[(i64, i64)]) -> Relation {
         rows.iter()
@@ -297,20 +225,6 @@ mod tests {
                 )
             })
             .collect()
-    }
-
-    #[test]
-    fn diff_then_apply_round_trips() {
-        let a = rel(&[(1, 10), (2, 20), (3, 30)]);
-        let b = rel(&[(2, 25), (3, 30), (4, 40)]);
-        let d = a.diff(&b);
-        assert_eq!(a.with_applied(&d), b);
-    }
-
-    #[test]
-    fn diff_of_identical_relations_is_empty() {
-        let a = rel(&[(1, 10)]);
-        assert!(a.diff(&a).is_empty());
     }
 
     #[test]
@@ -338,11 +252,14 @@ mod tests {
         store.load(7, rel(&[(1, 10), (2, 20), (3, 30), (4, 40)]));
 
         let mut source = Source::new(7, 0)
-            .with_pushdown(Predicate::Cmp {
-                lhs: crate::predicate::Expr::Col(1),
-                op: crate::predicate::CmpOp::Ge,
-                rhs: crate::predicate::Expr::Lit(Value::Int(20)),
-            })
+            .with_pushdown(
+                Predicate::Cmp {
+                    lhs: Expr::Col(1),
+                    op: CmpOp::Ge,
+                    rhs: Expr::Lit(Value::Int(20)),
+                },
+                Params::empty(),
+            )
             .with_limit(2);
 
         let batch = source.hydrate(&mut store);
@@ -360,12 +277,46 @@ mod tests {
         let rows = store.scan(&ScanRequest {
             table: 7,
             order: vec![(0, Dir::Asc)],
-            after: Some(vec![Value::Int(1)]),
+            after: Some(Cursor {
+                sort_key: vec![Value::Int(1)],
+                pk: RowKey::from(1),
+            }),
             filter: None,
+            params: Params::empty(),
             limit: 10,
         });
         let keys: Vec<_> = rows.iter().map(|(k, _)| k.clone()).collect();
         assert_eq!(keys, vec![RowKey::from(2), RowKey::from(3)]);
+    }
+
+    /// Rows tied on the sort key are split by the cursor's primary key, not
+    /// dropped wholesale — the bug a bare sort-key bound would have.
+    #[test]
+    fn a_cursor_splits_a_run_of_ties() {
+        let tied: Relation = (1i64..=3)
+            .map(|id| {
+                (
+                    RowKey::from(id),
+                    Row::new(vec![Value::Int(id), Value::Int(9)]),
+                )
+            })
+            .collect();
+        let mut store = MemStore::new();
+        store.load(7, tied);
+
+        let rows = store.scan(&ScanRequest {
+            table: 7,
+            order: vec![(1, Dir::Asc)],
+            after: Some(Cursor {
+                sort_key: vec![Value::Int(9)],
+                pk: RowKey::from(2),
+            }),
+            filter: None,
+            params: Params::empty(),
+            limit: 10,
+        });
+        let keys: Vec<_> = rows.iter().map(|(k, _)| k.clone()).collect();
+        assert_eq!(keys, vec![RowKey::from(3)]);
     }
 
     #[test]
@@ -378,10 +329,32 @@ mod tests {
             order: vec![(1, Dir::Desc)],
             after: None,
             filter: None,
+            params: Params::empty(),
             limit: 2,
         });
         let keys: Vec<_> = rows.iter().map(|(k, _)| k.clone()).collect();
         assert_eq!(keys, vec![RowKey::from(3), RowKey::from(2)]);
+    }
+
+    #[test]
+    fn a_scan_binds_parameters_in_a_pushed_down_filter() {
+        let mut store = MemStore::new();
+        store.load(7, rel(&[(1, 10), (2, 20), (3, 30)]));
+
+        let rows = store.scan(&ScanRequest {
+            table: 7,
+            order: vec![(0, Dir::Asc)],
+            after: None,
+            filter: Some(Predicate::Cmp {
+                lhs: Expr::Col(1),
+                op: CmpOp::Ge,
+                rhs: Expr::Param(0),
+            }),
+            params: Params::new(vec![Value::Int(20)]),
+            limit: 10,
+        });
+        let keys: Vec<_> = rows.iter().map(|(k, _)| k.clone()).collect();
+        assert_eq!(keys, vec![RowKey::from(2), RowKey::from(3)]);
     }
 
     #[test]
@@ -403,8 +376,76 @@ mod tests {
             order: vec![(1, Dir::Asc)],
             after: None,
             filter: None,
+            params: Params::empty(),
             limit: 10,
         });
         assert_eq!(rows[0].0, RowKey::from(2));
+    }
+
+    #[test]
+    fn the_oracle_evaluates_top_k_by_sorting_the_whole_relation() {
+        let plan = Reference::new(vec![Stage::TopK {
+            table: 7,
+            order: vec![(1, Dir::Desc)],
+            k: 2,
+            slack: 0,
+        }]);
+        assert_eq!(
+            plan.eval(&rel(&[(1, 10), (2, 40), (3, 30), (4, 20)])),
+            rel(&[(2, 40), (3, 30)])
+        );
+    }
+
+    /// Filters ahead of a `TopK` become its refill pushdown. Without this the
+    /// operator would refill from rows the filter had already excluded.
+    #[test]
+    fn build_pushes_upstream_filters_into_top_k() {
+        let pred = Predicate::Cmp {
+            lhs: Expr::Col(1),
+            op: CmpOp::Ge,
+            rhs: Expr::Param(0),
+        };
+        let plan = Reference::new(vec![
+            Stage::Filter { pred },
+            Stage::TopK {
+                table: 7,
+                order: vec![(1, Dir::Asc)],
+                k: 2,
+                slack: 0,
+            },
+        ])
+        .with_params(Params::new(vec![Value::Int(20)]));
+
+        let base = rel(&[(1, 10), (2, 20), (3, 30), (4, 40)]);
+        let mut store = MemStore::new();
+        store.load(7, base.clone());
+
+        let mut pipeline = plan.build();
+        let hydrate: Batch = base
+            .iter()
+            .map(|(key, row)| Change::Insert {
+                key: key.clone(),
+                row: row.clone(),
+            })
+            .collect();
+        pipeline.apply(&hydrate, &mut store);
+
+        // Drop row 2, forcing a refill. If the filter had not been pushed down
+        // the refill would surface row 1, which the filter excludes.
+        store.table(7).remove(&RowKey::from(2));
+        let out = pipeline.apply(
+            &[Change::Delete {
+                key: RowKey::from(2),
+                before: Row::new(vec![Value::Int(2), Value::Int(20)]),
+            }]
+            .into_iter()
+            .collect(),
+            &mut store,
+        );
+
+        let mut view = plan.eval(&base);
+        view.apply(&out);
+        assert_eq!(view, rel(&[(3, 30), (4, 40)]));
+        assert_eq!(store.refills, 1);
     }
 }

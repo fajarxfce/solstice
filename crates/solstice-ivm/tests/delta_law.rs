@@ -22,19 +22,33 @@
 //!   over a live key, a delete carrying the wrong before-image — and the law
 //!   simply does not hold for those. Resolving edits makes every batch
 //!   well-formed by construction, so a failure is always a real one.
+//!
+//! # `TopK` and the store
+//!
+//! `TopK` is the first operator with state, and the first that reads the store
+//! (plan §1.3). That makes the store part of the law: a refill must see the
+//! relation *after* the batch it is refilling for, because the engine commits
+//! before it pumps the graph (plan §1.4). Every test here therefore loads a
+//! [`MemStore`] with the post-batch relation, and a `TopK` is given the
+//! conjunction of the filters above it as refill pushdown.
+//!
+//! The parameters are tuned to make refills the common case rather than a rare
+//! one: `k` of 1..=4 and slack of 0..=2 over at most 12 rows means almost every
+//! delete of a visible row has to go back to the store.
 
 use proptest::prelude::*;
 use solstice_ivm::delta::Change;
-use solstice_ivm::operator::NoCx;
-use solstice_ivm::predicate::{CmpOp, Expr, Params, Predicate};
-use solstice_ivm::reference::{Reference, Relation, Stage};
-use solstice_ivm::{Batch, ColId, Pipeline, Row, RowKey, Value};
+use solstice_ivm::reference::{MemStore, Reference, Stage};
+use solstice_ivm::{Batch, ColId, Dir, Params, Pipeline, Relation, Row, RowKey, Value};
+use solstice_ivm::{CmpOp, Expr, Predicate};
 use std::sync::Arc;
 
 /// Width of the generated base relation.
 const ARITY: usize = 4;
 /// Key space. Small, so that inserts, updates and deletes actually collide.
 const KEYS: i64 = 8;
+/// The one table every generated plan reads.
+const TABLE: solstice_ivm::TableId = 1;
 
 fn arb_value() -> impl Strategy<Value = Value> {
     prop_oneof![
@@ -100,20 +114,59 @@ fn arb_params() -> impl Strategy<Value = Params> {
     prop::collection::vec(arb_value(), 2).prop_map(Params::new)
 }
 
-fn arb_stage() -> impl Strategy<Value = Stage> {
-    prop_oneof![
-        3 => (arb_predicate(), arb_params())
-            .prop_map(|(pred, params)| Stage::Filter { pred, params }),
-        // Projections may repeat, reorder, and drop columns — including
-        // projecting away a column a later filter reads, which is legal and
-        // must simply read as NULL rather than panic.
-        1 => prop::collection::vec(0..ARITY as ColId, 1..=ARITY)
-            .prop_map(|cols| Stage::Project { cols }),
-    ]
+fn arb_filter() -> impl Strategy<Value = Stage> {
+    arb_predicate().prop_map(|pred| Stage::Filter { pred })
 }
 
+/// Projections may repeat, reorder, and drop columns — including projecting
+/// away a column a later filter reads, which is legal and must simply read as
+/// NULL rather than panic.
+fn arb_project() -> impl Strategy<Value = Stage> {
+    prop::collection::vec(0..ARITY as ColId, 1..=ARITY).prop_map(|cols| Stage::Project { cols })
+}
+
+fn arb_order() -> impl Strategy<Value = Vec<(ColId, Dir)>> {
+    prop::collection::vec(
+        (
+            0..ARITY as ColId,
+            prop_oneof![Just(Dir::Asc), Just(Dir::Desc)],
+        ),
+        1..=2,
+    )
+}
+
+fn arb_topk() -> impl Strategy<Value = Stage> {
+    (arb_order(), 1usize..=4, 0usize..=2).prop_map(|(order, k, slack)| Stage::TopK {
+        table: TABLE,
+        order,
+        k,
+        slack,
+    })
+}
+
+/// Plans have the shape a real optimiser emits: **filters pushed all the way
+/// down, `TopK` next, projection last**.
+///
+/// This is not just convenience. `ORDER BY` in DQL is restricted to indexed
+/// columns of the root table (plan §1.1), so a `TopK` always *can* sit directly
+/// above the filters — and putting it there is what lets its refill be a single
+/// bounded, filtered scan of one table. A projection below it could rename or
+/// drop the very columns the refill sorts on.
 fn arb_plan() -> impl Strategy<Value = Reference> {
-    prop::collection::vec(arb_stage(), 0..4).prop_map(Reference::new)
+    (
+        prop::collection::vec(arb_filter(), 0..3),
+        prop::option::of(arb_topk()),
+        prop::collection::vec(arb_project(), 0..2),
+        arb_params(),
+    )
+        .prop_map(|(filters, topk, projects, params)| {
+            let stages = filters
+                .into_iter()
+                .chain(topk)
+                .chain(projects)
+                .collect::<Vec<_>>();
+            Reference::new(stages).with_params(params)
+        })
 }
 
 fn arb_relation() -> impl Strategy<Value = Relation> {
@@ -179,8 +232,23 @@ fn as_inserts(rel: &Relation) -> Batch {
         .collect()
 }
 
-fn pipeline_of(plan: &Reference) -> Pipeline {
-    Pipeline::new(plan.stages().iter().map(|s| s.build()).collect())
+fn store_of(rel: &Relation) -> MemStore {
+    let mut store = MemStore::new();
+    store.load(TABLE, rel.clone());
+    store
+}
+
+/// A pipeline brought up to date with `base`, exactly as the engine does it:
+/// hydrate against a store holding `base`, then leave it ready for deltas.
+///
+/// Hydrating through `apply` rather than seeding state directly is the point —
+/// if the two ever diverged, a view would be right on first load and wrong
+/// after an edit (or the reverse), which is the bug class this file exists to
+/// rule out.
+fn hydrated(plan: &Reference, base: &Relation) -> Pipeline {
+    let mut pipeline = plan.build();
+    pipeline.apply(&as_inserts(base), &mut store_of(base));
+    pipeline
 }
 
 proptest! {
@@ -194,13 +262,15 @@ proptest! {
         edits in arb_edits(),
     ) {
         let delta = resolve(&base, &edits);
+        let after = base.with_applied(&delta);
 
         // Left: recompute over the updated relation.
-        let expected = plan.eval(&base.with_applied(&delta));
+        let expected = plan.eval(&after);
 
-        // Right: maintain the previous result incrementally.
-        let mut pipeline = pipeline_of(&plan);
-        let out = pipeline.apply(&delta, &mut NoCx);
+        // Right: maintain the previous result incrementally. The store holds
+        // the post-batch relation because the engine commits before it pumps.
+        let mut pipeline = hydrated(&plan, &base);
+        let out = pipeline.apply(&delta, &mut store_of(&after));
         let actual = plan.eval(&base).with_applied(&out);
 
         prop_assert_eq!(expected, actual);
@@ -216,9 +286,34 @@ proptest! {
         plan in arb_plan(),
         base in arb_relation(),
     ) {
-        let mut pipeline = pipeline_of(&plan);
-        let out = pipeline.apply(&as_inserts(&base), &mut NoCx);
+        let mut pipeline = plan.build();
+        let out = pipeline.apply(&as_inserts(&base), &mut store_of(&base));
         prop_assert_eq!(plan.eval(&base), Relation::new().with_applied(&out));
+    }
+
+    /// A long run of deltas must not drift.
+    ///
+    /// One step can be correct while the window's bookkeeping rots over many —
+    /// slack quietly filling with rows that no longer exist, `full` latching
+    /// true after a truncation, a cursor built from a row that was already
+    /// evicted. Only repetition finds those.
+    #[test]
+    fn a_run_of_deltas_never_drifts(
+        plan in arb_plan(),
+        base in arb_relation(),
+        runs in prop::collection::vec(arb_edits(), 1..6),
+    ) {
+        let mut pipeline = hydrated(&plan, &base);
+        let mut rel = base.clone();
+        let mut view = plan.eval(&base);
+
+        for edits in &runs {
+            let delta = resolve(&rel, edits);
+            rel = rel.with_applied(&delta);
+            let out = pipeline.apply(&delta, &mut store_of(&rel));
+            view.apply(&out);
+            prop_assert_eq!(&view, &plan.eval(&rel));
+        }
     }
 
     /// Coalescing under backpressure must not change the result.
@@ -236,14 +331,15 @@ proptest! {
         let d1 = resolve(&base, &first);
         let mid = base.with_applied(&d1);
         let d2 = resolve(&mid, &second);
+        let end = mid.with_applied(&d2);
 
-        let mut stepwise = pipeline_of(&plan);
+        let mut stepwise = hydrated(&plan, &base);
         let out_stepwise = stepwise
-            .apply(&d1, &mut NoCx)
-            .compose(stepwise.apply(&d2, &mut NoCx));
+            .apply(&d1, &mut store_of(&mid))
+            .compose(stepwise.apply(&d2, &mut store_of(&end)));
 
-        let mut coalesced = pipeline_of(&plan);
-        let out_coalesced = coalesced.apply(&d1.clone().compose(d2), &mut NoCx);
+        let mut coalesced = hydrated(&plan, &base);
+        let out_coalesced = coalesced.apply(&d1.clone().compose(d2), &mut store_of(&end));
 
         let start = plan.eval(&base);
         prop_assert_eq!(
@@ -274,9 +370,44 @@ proptest! {
         edits in arb_edits(),
     ) {
         let delta = resolve(&base, &edits);
-        let mut pipeline = pipeline_of(&plan);
-        for change in pipeline.apply(&delta, &mut NoCx).iter() {
+        let mut pipeline = hydrated(&plan, &base);
+        let out = pipeline.apply(&delta, &mut store_of(&base.with_applied(&delta)));
+        for change in out.iter() {
             prop_assert_ne!(change.before(), change.after());
+        }
+    }
+
+    /// `TopK` never holds more than `k + slack` rows, whatever the relation
+    /// does to it.
+    ///
+    /// This is the memory bound the whole design rests on (plan §7): state
+    /// proportional to the *view*, never to the table. A `TopK` that quietly
+    /// accumulated rows would pass every correctness test above and still sink
+    /// the project on a real device.
+    #[test]
+    fn state_stays_proportional_to_the_view(
+        order in arb_order(),
+        k in 1usize..=4,
+        slack in 0usize..=2,
+        base in arb_relation(),
+        runs in prop::collection::vec(arb_edits(), 1..4),
+    ) {
+        let plan = Reference::new(vec![Stage::TopK { table: TABLE, order, k, slack }]);
+        let mut pipeline = hydrated(&plan, &base);
+
+        let row_bytes = ARITY * std::mem::size_of::<Value>();
+        let budget = (k + slack) * (row_bytes + 128);
+
+        let mut rel = base;
+        for edits in &runs {
+            let delta = resolve(&rel, edits);
+            rel = rel.with_applied(&delta);
+            pipeline.apply(&delta, &mut store_of(&rel));
+            prop_assert!(
+                pipeline.state_bytes() <= budget,
+                "TopK held {} bytes for k={} slack={} over {} rows",
+                pipeline.state_bytes(), k, slack, rel.len()
+            );
         }
     }
 }

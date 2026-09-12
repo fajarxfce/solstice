@@ -21,15 +21,10 @@
 //! the first commit rather than bolted on at M5.
 
 use crate::delta::Batch;
-use crate::predicate::Predicate;
+use crate::order::{Cursor, Dir};
+use crate::predicate::{Params, Predicate};
 use crate::schema::TableId;
-use crate::value::{ColId, Row, RowKey, Value};
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum Dir {
-    Asc,
-    Desc,
-}
+use crate::value::{ColId, Row, RowKey};
 
 /// An ordered, bounded read against the canonical store.
 ///
@@ -42,12 +37,22 @@ pub struct ScanRequest {
     pub table: TableId,
     /// Sort order; must be an indexed prefix (plan §1.1).
     pub order: Vec<(ColId, Dir)>,
-    /// Exclusive lower bound in `order`'s ordering — the sort key of the last
-    /// row the caller already holds. `None` scans from the start.
-    pub after: Option<Vec<Value>>,
+    /// Exclusive lower bound — the position of the last row the caller already
+    /// holds. `None` scans from the start.
+    ///
+    /// A [`Cursor`] rather than a bare sort key because sort keys tie; see the
+    /// [`crate::order`] module docs for what ties cost.
+    pub after: Option<Cursor>,
     /// Filter pushed down from upstream, so a refill does not return rows the
     /// caller would immediately discard.
     pub filter: Option<Predicate>,
+    /// Bindings for any `Param` in `filter`.
+    ///
+    /// Carried explicitly because a pushed-down predicate that reads an unbound
+    /// parameter evaluates it as NULL, which makes the comparison unknown and
+    /// the row invisible — a scan that silently returns too few rows rather
+    /// than failing.
+    pub params: Params,
     pub limit: usize,
 }
 
@@ -58,6 +63,18 @@ pub struct ScanRequest {
 /// whole engine simulatable.
 pub trait OpCx {
     /// Run a bounded scan against the canonical store.
+    ///
+    /// # Contract: the scan sees the batch being processed
+    ///
+    /// When called from [`Operator::apply`], the returned rows **must** reflect
+    /// every change in the batch currently being applied. The engine commits the
+    /// store transaction and only then pumps the graph (plan §1.4), so this
+    /// holds by construction.
+    ///
+    /// It has to be stated because violating it is silent: a `TopK` refilling
+    /// after a delete would read the row it just deleted back out of the store
+    /// and re-insert it into the view. Nothing would panic; the list would
+    /// simply be wrong.
     fn scan(&mut self, req: &ScanRequest) -> Vec<(RowKey, Row)>;
 
     /// Report that a bounded requery happened, so it surfaces in

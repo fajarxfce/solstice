@@ -49,6 +49,20 @@ impl Value {
         matches!(self, Value::Null)
     }
 
+    /// Bytes this value owns beyond its own discriminant.
+    ///
+    /// Approximate on purpose: it ignores allocator overhead and counts a shared
+    /// `Arc` payload once per holder. Operator memory budgets are enforced at
+    /// megabyte granularity (plan §7), so an estimate that is cheap enough to
+    /// call on every state query beats an exact figure that nobody calls.
+    pub fn heap_bytes(&self) -> usize {
+        match self {
+            Value::Null | Value::Int(_) | Value::Real(_) => 0,
+            Value::Text(s) => s.len(),
+            Value::Blob(b) => b.len(),
+        }
+    }
+
     /// SQLite storage-class rank, used for the structural order and for
     /// cross-class SQL comparison. NULL < numeric < text < blob.
     fn class_rank(&self) -> u8 {
@@ -253,6 +267,12 @@ impl Row {
         &self.values
     }
 
+    /// Bytes this row owns: the value slice plus anything the values point at.
+    pub fn heap_bytes(&self) -> usize {
+        self.values.len() * std::mem::size_of::<Value>()
+            + self.values.iter().map(Value::heap_bytes).sum::<usize>()
+    }
+
     /// Project onto a subset of columns, preserving the given order.
     pub fn project(&self, cols: &[ColId]) -> Row {
         Row::new(
@@ -283,6 +303,10 @@ impl RowKey {
 
     pub fn value(&self) -> &Value {
         &self.0
+    }
+
+    pub fn heap_bytes(&self) -> usize {
+        self.0.heap_bytes()
     }
 }
 

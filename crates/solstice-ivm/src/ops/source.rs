@@ -1,8 +1,9 @@
 //! `Source` — the only operator that reads the store.
 
 use crate::delta::{Batch, Change};
-use crate::operator::{Dir, OpCx, Operator, ScanRequest};
-use crate::predicate::Predicate;
+use crate::operator::{OpCx, Operator, ScanRequest};
+use crate::order::Dir;
+use crate::predicate::{Params, Predicate};
 use crate::schema::TableId;
 use crate::value::ColId;
 
@@ -32,6 +33,7 @@ pub struct Source {
     /// Filter pushed down into hydration so the scan does not materialise rows
     /// the first downstream `Filter` would immediately drop.
     pushdown: Option<Predicate>,
+    params: Params,
     order: Vec<(ColId, Dir)>,
     /// Upper bound on hydration. `None` means unbounded, which is only valid
     /// for a query that opted in via `allow_unbounded` (plan §1.2).
@@ -44,14 +46,16 @@ impl Source {
         Source {
             table,
             pushdown: None,
+            params: Params::empty(),
             order: Vec::new(),
             limit: None,
             pk,
         }
     }
 
-    pub fn with_pushdown(mut self, pred: Predicate) -> Self {
+    pub fn with_pushdown(mut self, pred: Predicate, params: Params) -> Self {
         self.pushdown = Some(pred);
+        self.params = params;
         self
     }
 
@@ -95,6 +99,7 @@ impl Operator for Source {
             order,
             after: None,
             filter: self.pushdown.clone(),
+            params: self.params.clone(),
             limit: self.limit.unwrap_or(usize::MAX),
         };
 

@@ -34,14 +34,18 @@
 pub mod delta;
 pub mod operator;
 pub mod ops;
+pub mod order;
 pub mod predicate;
 pub mod reference;
+pub mod relation;
 pub mod schema;
 pub mod value;
 
 pub use delta::{Batch, Change};
-pub use operator::{Degrade, Dir, NoCx, OpCx, Operator, Pipeline, ScanRequest};
+pub use operator::{Degrade, NoCx, OpCx, Operator, Pipeline, ScanRequest};
+pub use order::{Cursor, Dir};
 pub use predicate::{CmpOp, Expr, Params, Predicate, Tri};
-pub use reference::{Reference, Relation, Stage};
+pub use reference::{Reference, Stage};
+pub use relation::Relation;
 pub use schema::{Column, Schema, TableId, ValueType};
 pub use value::{ColId, Row, RowKey, Value};
