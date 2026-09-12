@@ -1,7 +1,7 @@
 //! `Source` — the only operator that reads the store.
 
 use crate::delta::{Batch, Change};
-use crate::operator::{OpCx, Operator, ScanRequest};
+use crate::operator::{Inputs, OpCx, Operator, ScanRequest};
 use crate::order::Dir;
 use crate::predicate::{Params, Predicate};
 use crate::schema::TableId;
@@ -79,8 +79,8 @@ impl Operator for Source {
         "Source"
     }
 
-    fn apply(&mut self, input: &Batch, _cx: &mut dyn OpCx) -> Batch {
-        input.clone()
+    fn apply(&mut self, input: Inputs<'_>, _cx: &mut dyn OpCx) -> Batch {
+        input.primary().clone()
     }
 
     fn hydrate(&mut self, cx: &mut dyn OpCx) -> Batch {

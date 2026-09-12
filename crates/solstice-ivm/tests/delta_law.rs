@@ -39,7 +39,7 @@
 use proptest::prelude::*;
 use solstice_ivm::delta::Change;
 use solstice_ivm::reference::{MemStore, Reference, Stage};
-use solstice_ivm::{Batch, ColId, Dir, Params, Pipeline, Relation, Row, RowKey, Value};
+use solstice_ivm::{Batch, ColId, Dir, Graph, Params, Relation, Row, RowKey, Value};
 use solstice_ivm::{CmpOp, Expr, Predicate};
 use std::sync::Arc;
 
@@ -49,6 +49,10 @@ const ARITY: usize = 4;
 const KEYS: i64 = 8;
 /// The one table every generated plan reads.
 const TABLE: solstice_ivm::TableId = 1;
+/// Primary key column for the source's hydration scan. Arbitrary — generated
+/// keys are independent of row contents — but it has to be *some* column, and
+/// scanning in a defined order is what keeps hydration deterministic (plan §6).
+const PK: ColId = 0;
 
 fn arb_value() -> impl Strategy<Value = Value> {
     prop_oneof![
@@ -137,7 +141,6 @@ fn arb_order() -> impl Strategy<Value = Vec<(ColId, Dir)>> {
 
 fn arb_topk() -> impl Strategy<Value = Stage> {
     (arb_order(), 1usize..=4, 0usize..=2).prop_map(|(order, k, slack)| Stage::TopK {
-        table: TABLE,
         order,
         k,
         slack,
@@ -165,7 +168,7 @@ fn arb_plan() -> impl Strategy<Value = Reference> {
                 .chain(topk)
                 .chain(projects)
                 .collect::<Vec<_>>();
-            Reference::new(stages).with_params(params)
+            Reference::new(TABLE, PK, stages).with_params(params)
         })
 }
 
@@ -221,34 +224,28 @@ fn resolve(rel: &Relation, edits: &[Edit]) -> Batch {
     batch
 }
 
-/// The whole relation expressed as a batch of inserts — what a `Source` emits
-/// on hydration.
-fn as_inserts(rel: &Relation) -> Batch {
-    rel.iter()
-        .map(|(key, row)| Change::Insert {
-            key: key.clone(),
-            row: row.clone(),
-        })
-        .collect()
-}
-
 fn store_of(rel: &Relation) -> MemStore {
     let mut store = MemStore::new();
     store.load(TABLE, rel.clone());
     store
 }
 
-/// A pipeline brought up to date with `base`, exactly as the engine does it:
+/// A graph brought up to date with `base`, exactly as the engine does it:
 /// hydrate against a store holding `base`, then leave it ready for deltas.
 ///
 /// Hydrating through `apply` rather than seeding state directly is the point —
 /// if the two ever diverged, a view would be right on first load and wrong
 /// after an edit (or the reverse), which is the bug class this file exists to
 /// rule out.
-fn hydrated(plan: &Reference, base: &Relation) -> Pipeline {
-    let mut pipeline = plan.build();
-    pipeline.apply(&as_inserts(base), &mut store_of(base));
-    pipeline
+fn hydrated(plan: &Reference, base: &Relation) -> Graph {
+    let mut graph = plan.build();
+    graph.hydrate(&mut store_of(base));
+    graph
+}
+
+/// One coherent pump of the single table these plans read.
+fn pump(graph: &mut Graph, delta: Batch, store: &mut MemStore) -> Batch {
+    graph.pump(&[(TABLE, delta)], store)
 }
 
 proptest! {
@@ -269,8 +266,8 @@ proptest! {
 
         // Right: maintain the previous result incrementally. The store holds
         // the post-batch relation because the engine commits before it pumps.
-        let mut pipeline = hydrated(&plan, &base);
-        let out = pipeline.apply(&delta, &mut store_of(&after));
+        let mut graph = hydrated(&plan, &base);
+        let out = pump(&mut graph, delta, &mut store_of(&after));
         let actual = plan.eval(&base).with_applied(&out);
 
         prop_assert_eq!(expected, actual);
@@ -286,8 +283,8 @@ proptest! {
         plan in arb_plan(),
         base in arb_relation(),
     ) {
-        let mut pipeline = plan.build();
-        let out = pipeline.apply(&as_inserts(&base), &mut store_of(&base));
+        let mut graph = plan.build();
+        let out = graph.hydrate(&mut store_of(&base));
         prop_assert_eq!(plan.eval(&base), Relation::new().with_applied(&out));
     }
 
@@ -303,14 +300,14 @@ proptest! {
         base in arb_relation(),
         runs in prop::collection::vec(arb_edits(), 1..6),
     ) {
-        let mut pipeline = hydrated(&plan, &base);
+        let mut graph = hydrated(&plan, &base);
         let mut rel = base.clone();
         let mut view = plan.eval(&base);
 
         for edits in &runs {
             let delta = resolve(&rel, edits);
             rel = rel.with_applied(&delta);
-            let out = pipeline.apply(&delta, &mut store_of(&rel));
+            let out = pump(&mut graph, delta, &mut store_of(&rel));
             view.apply(&out);
             prop_assert_eq!(&view, &plan.eval(&rel));
         }
@@ -334,12 +331,12 @@ proptest! {
         let end = mid.with_applied(&d2);
 
         let mut stepwise = hydrated(&plan, &base);
-        let out_stepwise = stepwise
-            .apply(&d1, &mut store_of(&mid))
-            .compose(stepwise.apply(&d2, &mut store_of(&end)));
+        let first_out = pump(&mut stepwise, d1.clone(), &mut store_of(&mid));
+        let out_stepwise =
+            first_out.compose(pump(&mut stepwise, d2.clone(), &mut store_of(&end)));
 
         let mut coalesced = hydrated(&plan, &base);
-        let out_coalesced = coalesced.apply(&d1.clone().compose(d2), &mut store_of(&end));
+        let out_coalesced = pump(&mut coalesced, d1.compose(d2), &mut store_of(&end));
 
         let start = plan.eval(&base);
         prop_assert_eq!(
@@ -370,8 +367,9 @@ proptest! {
         edits in arb_edits(),
     ) {
         let delta = resolve(&base, &edits);
-        let mut pipeline = hydrated(&plan, &base);
-        let out = pipeline.apply(&delta, &mut store_of(&base.with_applied(&delta)));
+        let mut graph = hydrated(&plan, &base);
+        let after = base.with_applied(&delta);
+        let out = pump(&mut graph, delta, &mut store_of(&after));
         for change in out.iter() {
             prop_assert_ne!(change.before(), change.after());
         }
@@ -392,8 +390,8 @@ proptest! {
         base in arb_relation(),
         runs in prop::collection::vec(arb_edits(), 1..4),
     ) {
-        let plan = Reference::new(vec![Stage::TopK { table: TABLE, order, k, slack }]);
-        let mut pipeline = hydrated(&plan, &base);
+        let plan = Reference::new(TABLE, PK, vec![Stage::TopK { order, k, slack }]);
+        let mut graph = hydrated(&plan, &base);
 
         let row_bytes = ARITY * std::mem::size_of::<Value>();
         let budget = (k + slack) * (row_bytes + 128);
@@ -402,11 +400,11 @@ proptest! {
         for edits in &runs {
             let delta = resolve(&rel, edits);
             rel = rel.with_applied(&delta);
-            pipeline.apply(&delta, &mut store_of(&rel));
+            pump(&mut graph, delta, &mut store_of(&rel));
             prop_assert!(
-                pipeline.state_bytes() <= budget,
+                graph.state_bytes() <= budget,
                 "TopK held {} bytes for k={} slack={} over {} rows",
-                pipeline.state_bytes(), k, slack, rel.len()
+                graph.state_bytes(), k, slack, rel.len()
             );
         }
     }

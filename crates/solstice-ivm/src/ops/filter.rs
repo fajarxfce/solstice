@@ -1,7 +1,7 @@
 //! `Filter` — stateless, and the delta rule is subtler than it looks.
 
 use crate::delta::{Batch, Change};
-use crate::operator::{OpCx, Operator};
+use crate::operator::{Inputs, OpCx, Operator};
 use crate::predicate::{Params, Predicate};
 
 /// Drops rows that do not satisfy a predicate.
@@ -46,8 +46,9 @@ impl Operator for Filter {
         "Filter"
     }
 
-    fn apply(&mut self, input: &Batch, _cx: &mut dyn OpCx) -> Batch {
+    fn apply(&mut self, input: Inputs<'_>, _cx: &mut dyn OpCx) -> Batch {
         input
+            .primary()
             .iter()
             .filter_map(|change| {
                 let keep = |row: &crate::value::Row| self.pred.matches(row, &self.params);
@@ -85,7 +86,7 @@ mod tests {
         .into_iter()
         .collect();
 
-        let out = f.apply(&batch, &mut NoCx);
+        let out = f.apply(Inputs::single(&batch), &mut NoCx);
         assert_eq!(
             out.get(&RowKey::from(1)),
             Some(&Change::Delete {
@@ -106,7 +107,7 @@ mod tests {
         .into_iter()
         .collect();
 
-        let out = f.apply(&batch, &mut NoCx);
+        let out = f.apply(Inputs::single(&batch), &mut NoCx);
         assert_eq!(
             out.get(&RowKey::from(1)),
             Some(&Change::Insert {
@@ -133,7 +134,7 @@ mod tests {
         .into_iter()
         .collect();
 
-        assert!(f.apply(&batch, &mut NoCx).is_empty());
+        assert!(f.apply(Inputs::single(&batch), &mut NoCx).is_empty());
     }
 
     #[test]
@@ -148,7 +149,7 @@ mod tests {
         }]
         .into_iter()
         .collect();
-        assert!(f.apply(&batch, &mut NoCx).is_empty());
+        assert!(f.apply(Inputs::single(&batch), &mut NoCx).is_empty());
     }
 
     #[test]

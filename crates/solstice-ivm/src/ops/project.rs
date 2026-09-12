@@ -1,7 +1,7 @@
 //! `Project` — stateless, and it does more work than reshaping rows.
 
 use crate::delta::{Batch, Change};
-use crate::operator::{OpCx, Operator};
+use crate::operator::{Inputs, OpCx, Operator};
 use crate::value::ColId;
 
 /// Selects a subset of columns, in the given order.
@@ -37,8 +37,9 @@ impl Operator for Project {
         "Project"
     }
 
-    fn apply(&mut self, input: &Batch, _cx: &mut dyn OpCx) -> Batch {
+    fn apply(&mut self, input: Inputs<'_>, _cx: &mut dyn OpCx) -> Batch {
         input
+            .primary()
             .iter()
             .filter_map(|change| {
                 Change::from_images(
@@ -74,7 +75,7 @@ mod tests {
         .collect();
 
         assert!(
-            p.apply(&batch, &mut NoCx).is_empty(),
+            p.apply(Inputs::single(&batch), &mut NoCx).is_empty(),
             "the view does not show `body`, so nothing downstream should wake up"
         );
     }
@@ -91,7 +92,8 @@ mod tests {
         .collect();
 
         assert_eq!(
-            p.apply(&batch, &mut NoCx).get(&RowKey::from(1)),
+            p.apply(Inputs::single(&batch), &mut NoCx)
+                .get(&RowKey::from(1)),
             Some(&Change::Update {
                 key: RowKey::from(1),
                 before: Row::new(vec![Value::Int(1), Value::text("old")]),
@@ -111,7 +113,8 @@ mod tests {
         .collect();
 
         assert_eq!(
-            p.apply(&batch, &mut NoCx).get(&RowKey::from(1)),
+            p.apply(Inputs::single(&batch), &mut NoCx)
+                .get(&RowKey::from(1)),
             Some(&Change::Insert {
                 key: RowKey::from(1),
                 row: Row::new(vec![Value::text("t"), Value::Int(1)]),

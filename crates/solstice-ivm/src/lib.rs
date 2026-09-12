@@ -32,6 +32,7 @@
 //! rather than by testing.
 
 pub mod delta;
+pub mod graph;
 pub mod operator;
 pub mod ops;
 pub mod order;
@@ -42,7 +43,8 @@ pub mod schema;
 pub mod value;
 
 pub use delta::{Batch, Change};
-pub use operator::{Degrade, NoCx, OpCx, Operator, Pipeline, ScanRequest};
+pub use graph::{Graph, GraphBuilder, NodeId};
+pub use operator::{Degrade, Inputs, NoCx, OpCx, Operator, Port, ScanRequest};
 pub use order::{Cursor, Dir};
 pub use predicate::{CmpOp, Expr, Params, Predicate, Tri};
 pub use reference::{Reference, Stage};

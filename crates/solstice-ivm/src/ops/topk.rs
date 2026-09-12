@@ -6,7 +6,7 @@
 //! move across its boundary.
 
 use crate::delta::Batch;
-use crate::operator::{Degrade, OpCx, Operator, ScanRequest};
+use crate::operator::{Degrade, Inputs, OpCx, Operator, ScanRequest};
 use crate::order::{cmp_entry, Cursor, Dir};
 use crate::predicate::{Params, Predicate};
 use crate::relation::Relation;
@@ -281,7 +281,7 @@ impl Operator for TopK {
         "TopK"
     }
 
-    fn apply(&mut self, input: &Batch, cx: &mut dyn OpCx) -> Batch {
+    fn apply(&mut self, input: Inputs<'_>, cx: &mut dyn OpCx) -> Batch {
         // Snapshot, mutate, diff — rather than case-analysing which of the four
         // ways each change can interact with the window boundary applies, and
         // which rows it displaces.
@@ -293,7 +293,7 @@ impl Operator for TopK {
         // track displaced keys incrementally, not to unroll the cases by hand.
         let before = self.snapshot();
 
-        for change in input.iter() {
+        for change in input.primary().iter() {
             if let Some(row) = change.before() {
                 self.remove(change.key(), row);
             }
@@ -376,6 +376,10 @@ mod tests {
             .collect()
     }
 
+    fn pump(t: &mut TopK, batch: &Batch, s: &mut MemStore) -> Batch {
+        t.apply(Inputs::single(batch), s)
+    }
+
     fn visible_ids(t: &TopK) -> Vec<i64> {
         t.visible()
             .iter()
@@ -390,7 +394,7 @@ mod tests {
     fn hydrated(rows: &[(i64, i64)], k: usize, slack: usize) -> (TopK, MemStore) {
         let mut s = store(rows);
         let mut t = TopK::new(T, order(), k).with_slack(slack);
-        t.apply(&inserts(rows), &mut s);
+        pump(&mut t, &inserts(rows), &mut s);
         (t, s)
     }
 
@@ -416,7 +420,7 @@ mod tests {
     #[test]
     fn an_insert_below_the_window_emits_nothing() {
         let (mut t, mut s) = hydrated(&[(1, 10), (2, 20), (3, 30)], 2, 0);
-        let out = t.apply(&inserts(&[(4, 99)]), &mut s);
+        let out = pump(&mut t, &inserts(&[(4, 99)]), &mut s);
         assert!(out.is_empty());
         assert_eq!(visible_ids(&t), vec![1, 2]);
     }
@@ -424,7 +428,7 @@ mod tests {
     #[test]
     fn an_insert_into_the_window_pushes_the_last_row_out() {
         let (mut t, mut s) = hydrated(&[(1, 10), (2, 20), (3, 30)], 2, 0);
-        let out = t.apply(&inserts(&[(4, 15)]), &mut s);
+        let out = pump(&mut t, &inserts(&[(4, 15)]), &mut s);
 
         assert_eq!(visible_ids(&t), vec![1, 4]);
         assert_eq!(out.len(), 2, "one row enters the view, one leaves");
@@ -442,12 +446,13 @@ mod tests {
     fn deleting_a_visible_row_refills_from_the_store() {
         let mut s = store(&[(1, 10), (2, 20), (3, 30)]);
         let mut t = TopK::new(T, order(), 2).with_slack(0);
-        t.apply(&inserts(&[(1, 10), (2, 20), (3, 30)]), &mut s);
+        pump(&mut t, &inserts(&[(1, 10), (2, 20), (3, 30)]), &mut s);
         assert_eq!(visible_ids(&t), vec![1, 2]);
 
         // The store is the post-commit state, so row 1 is gone from it too.
         s.table(T).remove(&RowKey::from(1));
-        let out = t.apply(
+        let out = pump(
+            &mut t,
             &[Change::Delete {
                 key: RowKey::from(1),
                 before: row(1, 10),
@@ -473,10 +478,15 @@ mod tests {
     fn slack_absorbs_deletes_without_touching_the_store() {
         let mut s = store(&[(1, 10), (2, 20), (3, 30), (4, 40)]);
         let mut t = TopK::new(T, order(), 2).with_slack(2);
-        t.apply(&inserts(&[(1, 10), (2, 20), (3, 30), (4, 40)]), &mut s);
+        pump(
+            &mut t,
+            &inserts(&[(1, 10), (2, 20), (3, 30), (4, 40)]),
+            &mut s,
+        );
 
         s.table(T).remove(&RowKey::from(1));
-        t.apply(
+        pump(
+            &mut t,
             &[Change::Delete {
                 key: RowKey::from(1),
                 before: row(1, 10),
@@ -494,13 +504,14 @@ mod tests {
     fn a_short_relation_is_learned_once_and_never_rescanned() {
         let mut s = store(&[(1, 10), (2, 20)]);
         let mut t = TopK::new(T, order(), 5).with_slack(0);
-        t.apply(&inserts(&[(1, 10), (2, 20)]), &mut s);
+        pump(&mut t, &inserts(&[(1, 10), (2, 20)]), &mut s);
         // Fewer rows than k and nothing was discarded, so the operator already
         // knows it has everything.
         assert_eq!(t.refills(), 0);
 
         s.table(T).remove(&RowKey::from(1));
-        t.apply(
+        pump(
+            &mut t,
             &[Change::Delete {
                 key: RowKey::from(1),
                 before: row(1, 10),
@@ -518,7 +529,8 @@ mod tests {
         let (mut t, mut s) = hydrated(&[(1, 10), (2, 20), (3, 30)], 2, 1);
         s.table(T).insert(RowKey::from(1), row(1, 99));
 
-        let out = t.apply(
+        let out = pump(
+            &mut t,
             &[Change::Update {
                 key: RowKey::from(1),
                 before: row(1, 10),
@@ -541,7 +553,8 @@ mod tests {
         let (mut t, mut s) = hydrated(&[(1, 10), (2, 20), (3, 30)], 2, 0);
         s.table(T).insert(RowKey::from(3), row(3, 1));
 
-        let out = t.apply(
+        let out = pump(
+            &mut t,
             &[Change::Update {
                 key: RowKey::from(3),
                 before: row(3, 30),
@@ -568,7 +581,8 @@ mod tests {
         let (mut t, mut s) = hydrated(&[(1, 10), (2, 20), (3, 30)], 3, 0);
         s.table(T).insert(RowKey::from(1), row(1, 25));
 
-        let out = t.apply(
+        let out = pump(
+            &mut t,
             &[Change::Update {
                 key: RowKey::from(1),
                 before: row(1, 10),
@@ -593,12 +607,17 @@ mod tests {
         // rather than from a stale cursor.
         let mut s = store(&[(1, 10), (2, 20), (3, 30), (4, 40)]);
         let mut t = TopK::new(T, order(), 2).with_slack(0);
-        t.apply(&inserts(&[(1, 10), (2, 20), (3, 30), (4, 40)]), &mut s);
+        pump(
+            &mut t,
+            &inserts(&[(1, 10), (2, 20), (3, 30), (4, 40)]),
+            &mut s,
+        );
 
         for id in [1, 2] {
             s.table(T).remove(&RowKey::from(id));
         }
-        t.apply(
+        pump(
+            &mut t,
             &[
                 Change::Delete {
                     key: RowKey::from(1),
@@ -624,11 +643,12 @@ mod tests {
         let rows: Vec<(i64, i64)> = (0..60).map(|i| (i, i)).collect();
         let mut s = store(&rows);
         let mut t = TopK::new(T, order(), 3).with_slack(0);
-        t.apply(&inserts(&rows), &mut s);
+        pump(&mut t, &inserts(&rows), &mut s);
 
         for id in 0..40 {
             s.table(T).remove(&RowKey::from(id));
-            t.apply(
+            pump(
+                &mut t,
                 &[Change::Delete {
                     key: RowKey::from(id),
                     before: row(id, id),

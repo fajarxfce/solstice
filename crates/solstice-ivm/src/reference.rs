@@ -8,8 +8,9 @@
 //! evaluator over `Vec<Row>`, SQLite itself via `IR → SQL`, and the incremental
 //! path. Oracle (b) arrives with `solstice-store`.
 
-use crate::operator::{OpCx, Operator, Pipeline, ScanRequest};
-use crate::ops::{Filter, Project, TopK};
+use crate::graph::{Graph, GraphBuilder};
+use crate::operator::{OpCx, ScanRequest};
+use crate::ops::{Filter, Project, Source, TopK};
 use crate::order::{cmp_entry, cmp_to_cursor, Dir};
 use crate::predicate::{Params, Predicate};
 use crate::relation::Relation;
@@ -27,7 +28,6 @@ pub enum Stage {
         cols: Vec<ColId>,
     },
     TopK {
-        table: TableId,
         order: Vec<(ColId, Dir)>,
         k: usize,
         slack: usize,
@@ -42,13 +42,17 @@ pub enum Stage {
 /// with the bindings it was written against.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Reference {
+    table: TableId,
+    pk: ColId,
     stages: Vec<Stage>,
     params: Params,
 }
 
 impl Reference {
-    pub fn new(stages: Vec<Stage>) -> Self {
+    pub fn new(table: TableId, pk: ColId, stages: Vec<Stage>) -> Self {
         Reference {
+            table,
+            pk,
             stages,
             params: Params::empty(),
         }
@@ -59,6 +63,10 @@ impl Reference {
         self
     }
 
+    pub fn table(&self) -> TableId {
+        self.table
+    }
+
     pub fn stages(&self) -> &[Stage] {
         &self.stages
     }
@@ -67,47 +75,52 @@ impl Reference {
         &self.params
     }
 
-    /// The incremental pipeline this plan corresponds to.
+    /// The incremental dataflow graph this plan corresponds to.
     ///
     /// Having both sides built from one description is what makes the delta law
-    /// testable: there is no chance of the oracle and the pipeline being handed
+    /// testable: there is no chance of the oracle and the graph being handed
     /// subtly different queries.
     ///
-    /// The one piece of real optimiser behaviour here is **filter pushdown into
-    /// `TopK`**, and it is not an optimisation — it is required for
-    /// correctness. A `TopK` refills by reading the base table, so without the
-    /// upstream filters it would pull in rows the pipeline has already decided
-    /// are not part of the relation, and hand them to the view.
-    pub fn build(&self) -> Pipeline {
+    /// The `Source` here deliberately scans the whole table rather than taking
+    /// the first filters as hydration pushdown. Pushdown would produce the same
+    /// view — and the real planner does it — but it would also mean `Filter`
+    /// never has to reject a row at hydration time, quietly shrinking what the
+    /// property tests cover.
+    ///
+    /// The one piece of real optimiser behaviour that *is* here is **filter
+    /// pushdown into `TopK`**, because that one is not an optimisation. A
+    /// `TopK` refills by reading the base table, so without the upstream filters
+    /// it would pull in rows the graph has already decided are not part of the
+    /// relation, and hand them to the view.
+    pub fn build(&self) -> Graph {
+        let mut b = GraphBuilder::new();
+        let mut node = b.source(self.table, Box::new(Source::new(self.table, self.pk)));
         let mut seen_filters: Vec<Predicate> = Vec::new();
-        let mut ops: Vec<Box<dyn Operator>> = Vec::new();
 
         for stage in &self.stages {
-            match stage {
+            node = match stage {
                 Stage::Filter { pred } => {
                     seen_filters.push(pred.clone());
-                    ops.push(Box::new(Filter::new(pred.clone(), self.params.clone())));
+                    b.add(
+                        Box::new(Filter::new(pred.clone(), self.params.clone())),
+                        vec![node],
+                    )
                 }
-                Stage::Project { cols } => ops.push(Box::new(Project::new(cols.clone()))),
-                Stage::TopK {
-                    table,
-                    order,
-                    k,
-                    slack,
-                } => {
-                    let mut top = TopK::new(*table, order.clone(), *k).with_slack(*slack);
+                Stage::Project { cols } => b.add(Box::new(Project::new(cols.clone())), vec![node]),
+                Stage::TopK { order, k, slack } => {
+                    let mut top = TopK::new(self.table, order.clone(), *k).with_slack(*slack);
                     if !seen_filters.is_empty() {
                         top = top.with_pushdown(
                             Predicate::and(seen_filters.clone()),
                             self.params.clone(),
                         );
                     }
-                    ops.push(Box::new(top));
+                    b.add(Box::new(top), vec![node])
                 }
-            }
+            };
         }
 
-        Pipeline::new(ops)
+        b.build(node)
     }
 
     /// Evaluate from scratch. O(relation) by construction, which is the point.
@@ -211,6 +224,7 @@ impl OpCx for MemStore {
 mod tests {
     use super::*;
     use crate::delta::{Batch, Change};
+    use crate::operator::Operator;
     use crate::ops::Source;
     use crate::order::Cursor;
     use crate::predicate::{CmpOp, Expr};
@@ -384,12 +398,15 @@ mod tests {
 
     #[test]
     fn the_oracle_evaluates_top_k_by_sorting_the_whole_relation() {
-        let plan = Reference::new(vec![Stage::TopK {
-            table: 7,
-            order: vec![(1, Dir::Desc)],
-            k: 2,
-            slack: 0,
-        }]);
+        let plan = Reference::new(
+            7,
+            0,
+            vec![Stage::TopK {
+                order: vec![(1, Dir::Desc)],
+                k: 2,
+                slack: 0,
+            }],
+        );
         assert_eq!(
             plan.eval(&rel(&[(1, 10), (2, 40), (3, 30), (4, 20)])),
             rel(&[(2, 40), (3, 30)])
@@ -405,43 +422,37 @@ mod tests {
             op: CmpOp::Ge,
             rhs: Expr::Param(0),
         };
-        let plan = Reference::new(vec![
-            Stage::Filter { pred },
-            Stage::TopK {
-                table: 7,
-                order: vec![(1, Dir::Asc)],
-                k: 2,
-                slack: 0,
-            },
-        ])
+        let plan = Reference::new(
+            7,
+            0,
+            vec![
+                Stage::Filter { pred },
+                Stage::TopK {
+                    order: vec![(1, Dir::Asc)],
+                    k: 2,
+                    slack: 0,
+                },
+            ],
+        )
         .with_params(Params::new(vec![Value::Int(20)]));
 
         let base = rel(&[(1, 10), (2, 20), (3, 30), (4, 40)]);
         let mut store = MemStore::new();
         store.load(7, base.clone());
 
-        let mut pipeline = plan.build();
-        let hydrate: Batch = base
-            .iter()
-            .map(|(key, row)| Change::Insert {
-                key: key.clone(),
-                row: row.clone(),
-            })
-            .collect();
-        pipeline.apply(&hydrate, &mut store);
+        let mut graph = plan.build();
+        graph.hydrate(&mut store);
 
         // Drop row 2, forcing a refill. If the filter had not been pushed down
         // the refill would surface row 1, which the filter excludes.
         store.table(7).remove(&RowKey::from(2));
-        let out = pipeline.apply(
-            &[Change::Delete {
-                key: RowKey::from(2),
-                before: Row::new(vec![Value::Int(2), Value::Int(20)]),
-            }]
-            .into_iter()
-            .collect(),
-            &mut store,
-        );
+        let delta: Batch = [Change::Delete {
+            key: RowKey::from(2),
+            before: Row::new(vec![Value::Int(2), Value::Int(20)]),
+        }]
+        .into_iter()
+        .collect();
+        let out = graph.pump(&[(7, delta)], &mut store);
 
         let mut view = plan.eval(&base);
         view.apply(&out);

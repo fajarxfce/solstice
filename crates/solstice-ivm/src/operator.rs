@@ -98,6 +98,67 @@ impl OpCx for NoCx {
     }
 }
 
+/// Which input an operator is reading from.
+///
+/// Almost every operator has exactly one. `Join` has two — parent on port 0,
+/// child on port 1 — and the ports are not interchangeable, so they are named
+/// by index rather than merged into one stream with a tag.
+pub type Port = usize;
+
+/// The batches arriving at an operator's input ports in one pump.
+///
+/// A single value rather than one `apply` call per port because a transaction
+/// that touches several tables must produce **one** coherent pump (plan §1.4).
+/// A two-input operator has to see both sides of that transaction together to
+/// emit a single coherent delta; calling it once per port would let it emit an
+/// intermediate state that never existed.
+#[derive(Clone, Copy)]
+pub struct Inputs<'a> {
+    ports: &'a [Batch],
+}
+
+impl<'a> Inputs<'a> {
+    /// The graph supplies exactly [`Operator::ports`] batches, one per port.
+    pub fn new(ports: &'a [Batch]) -> Self {
+        Inputs { ports }
+    }
+
+    /// The sole input of a single-input operator.
+    pub fn single(batch: &'a Batch) -> Self {
+        Inputs {
+            ports: std::slice::from_ref(batch),
+        }
+    }
+
+    /// Port 0 — the only input for most operators, the parent side for `Join`.
+    pub fn primary(&self) -> &'a Batch {
+        self.port(0)
+    }
+
+    /// # Panics
+    ///
+    /// If `port` is out of range. That means the graph wired fewer inputs than
+    /// the operator declares, which is a construction bug, not a runtime
+    /// condition — and one that would otherwise show up as a view that is
+    /// quietly missing one side of a join.
+    pub fn port(&self, port: Port) -> &'a Batch {
+        &self.ports[port]
+    }
+
+    pub fn len(&self) -> usize {
+        self.ports.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.ports.is_empty()
+    }
+
+    /// True when no port carries a change.
+    pub fn all_empty(&self) -> bool {
+        self.ports.iter().all(Batch::is_empty)
+    }
+}
+
 /// What happened when an operator was asked to shed state.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Degrade {
@@ -113,9 +174,22 @@ pub trait Operator: Send {
     /// Stable name for stats, tracing, and `solstice inspect`.
     fn name(&self) -> &'static str;
 
+    /// How many input ports this operator reads. One unless stated otherwise.
+    fn ports(&self) -> usize {
+        1
+    }
+
     /// The incremental step: given an upstream delta, produce this operator's
     /// delta.
-    fn apply(&mut self, input: &Batch, cx: &mut dyn OpCx) -> Batch;
+    ///
+    /// # Contract: no spontaneous output
+    ///
+    /// If every input port is empty, the output must be empty. Operators may
+    /// not emit changes nothing upstream asked for — that is what lets the
+    /// graph skip idle nodes, and more importantly it is what makes a view's
+    /// contents a function of its inputs rather than of how often it was
+    /// pumped.
+    fn apply(&mut self, input: Inputs<'_>, cx: &mut dyn OpCx) -> Batch;
 
     /// Initial contents as a batch of inserts. Only sources override this;
     /// see the module docs.
@@ -132,46 +206,5 @@ pub trait Operator: Send {
 
     fn degrade(&mut self) -> Degrade {
         Degrade::Stateless
-    }
-}
-
-/// A linear chain of operators.
-///
-/// Real pipelines are a DAG with shared subtrees (plan §1.3, operator sharing);
-/// a chain is enough for the stateless operators that exist today and keeps the
-/// property tests honest without pre-building a scheduler that has nothing to
-/// schedule yet.
-pub struct Pipeline {
-    ops: Vec<Box<dyn Operator>>,
-}
-
-impl Pipeline {
-    pub fn new(ops: Vec<Box<dyn Operator>>) -> Self {
-        Pipeline { ops }
-    }
-
-    pub fn apply(&mut self, input: &Batch, cx: &mut dyn OpCx) -> Batch {
-        let mut current = input.clone();
-        for op in &mut self.ops {
-            // An empty delta cannot produce output from a stateless or keyed
-            // operator, and short-circuiting keeps idle churn off the hot path.
-            if current.is_empty() {
-                return Batch::new();
-            }
-            current = op.apply(&current, cx);
-        }
-        current
-    }
-
-    pub fn state_bytes(&self) -> usize {
-        self.ops.iter().map(|o| o.state_bytes()).sum()
-    }
-
-    pub fn len(&self) -> usize {
-        self.ops.len()
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.ops.is_empty()
     }
 }
