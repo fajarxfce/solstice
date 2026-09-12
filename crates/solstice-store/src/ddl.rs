@@ -68,12 +68,39 @@ pub fn create_table(schema: &Schema) -> String {
 ///
 /// [`Cursor`]: solstice_ivm::order::Cursor
 pub fn create_order_index(schema: &Schema, order: &[(ColId, Dir)]) -> Option<String> {
-    if order.is_empty() {
+    create_seek_index(schema, &[], order)
+}
+
+/// The index for a scan that pins some columns by equality *before* ordering.
+///
+/// A per-parent child window asks for
+/// `WHERE issue_id = ? ORDER BY created_at DESC LIMIT 4`. An index on
+/// `(created_at DESC, id ASC)` answers that by walking the whole table newest
+/// first, testing `issue_id` on every entry, until it happens to find four rows
+/// belonging to this parent — the bound lost to the filter instead of to the
+/// sort, which is [`create_order_index`]'s failure mode wearing a different
+/// hat. Over a million comments behind a hundred thousand issues that walk is
+/// most of the table, per parent.
+///
+/// Leading with the equality columns turns the same statement into a seek: find
+/// the one parent's slice, read four entries off it, stop. The sort columns
+/// still have to follow in their scan directions, and the primary key still has
+/// to come last, for the reason given above.
+pub fn create_seek_index(schema: &Schema, eq: &[ColId], order: &[(ColId, Dir)]) -> Option<String> {
+    if eq.is_empty() && order.is_empty() {
         return None;
     }
 
     let mut parts: Vec<String> = Vec::new();
     let mut tag = String::new();
+
+    for col in eq {
+        let c = schema.columns.get(*col as usize)?;
+        parts.push(format!("{} ASC", quote_ident(&c.name)));
+        tag.push_str(&c.name);
+        tag.push_str("_e_");
+    }
+
     for (col, dir) in order {
         let c = schema.columns.get(*col as usize)?;
         let dir_sql = match dir {
@@ -86,6 +113,7 @@ pub fn create_order_index(schema: &Schema, order: &[(ColId, Dir)]) -> Option<Str
         tag.push_str(if matches!(dir, Dir::Asc) { "a" } else { "d" });
         tag.push('_');
     }
+
     parts.push(format!(
         "{} ASC",
         quote_ident(&schema.columns[schema.pk as usize].name)
@@ -141,5 +169,27 @@ mod tests {
     #[test]
     fn an_empty_order_needs_no_index() {
         assert_eq!(create_order_index(&schema(), &[]), None);
+    }
+
+    #[test]
+    fn a_seek_index_leads_with_the_equality_columns() {
+        // `WHERE project_id = ? ORDER BY priority DESC` — the equality column
+        // first, or the limit is not a limit.
+        let sql = create_seek_index(&schema(), &[1], &[(1, Dir::Desc)]).unwrap();
+        assert!(
+            sql.contains(r#"("priority" ASC, "priority" DESC, "id" ASC)"#),
+            "{sql}"
+        );
+    }
+
+    #[test]
+    fn a_seek_index_and_an_order_index_are_different_indexes() {
+        let seek = create_seek_index(&schema(), &[1], &[]).unwrap();
+        let order = create_order_index(&schema(), &[(1, Dir::Asc)]).unwrap();
+        assert_ne!(
+            seek, order,
+            "an equality prefix and a sort column must not collide on one name; \
+             CREATE INDEX IF NOT EXISTS would silently keep the wrong one"
+        );
     }
 }

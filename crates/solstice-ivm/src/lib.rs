@@ -44,7 +44,9 @@ pub mod value;
 
 pub use delta::{Batch, Change};
 pub use graph::{Graph, GraphBuilder, NodeId};
-pub use operator::{Degrade, Inputs, NoCx, OpCx, Operator, Port, ScanRequest};
+pub use operator::{
+    Degrade, Inputs, NoCx, OpCx, Operator, Port, RefillKind, RefillStats, ScanRequest,
+};
 pub use order::{Cursor, Dir};
 pub use predicate::{CmpOp, Expr, Params, Predicate, Tri};
 pub use reference::{JoinSpec, Reference, Stage, Tables};

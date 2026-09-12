@@ -6,7 +6,7 @@
 //! move across its boundary.
 
 use crate::delta::Batch;
-use crate::operator::{Degrade, Inputs, OpCx, Operator, ScanRequest};
+use crate::operator::{Degrade, Inputs, OpCx, Operator, RefillKind, ScanRequest};
 use crate::order::{cmp_entry, Cursor, Dir};
 use crate::predicate::{Params, Predicate};
 use crate::relation::Relation;
@@ -264,7 +264,7 @@ impl TopK {
         }
 
         self.refills += 1;
-        cx.note_refill(got);
+        cx.note_refill(RefillKind::Window, got);
         self.grow_slack_if_thrashing();
     }
 

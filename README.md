@@ -58,22 +58,30 @@ That is what M0 exists to answer, and the answer is not yet in. The question:
 > reasonable binary-size budget?
 
 If not, the premise collapses and this repository will say so. The kill criteria are
-fixed in advance and will be published as measured numbers, pass or fail:
+fixed in advance and published as measured numbers, pass or fail:
 
-| Metric | Budget |
-|---|---|
-| p99 delta → committed frame | < 16 ms |
-| Engine steady-state RSS | < 60 MB |
-| APK growth per ABI | < 8 MB |
-| Decode of an initial 1000-row view (Dart *and* Kotlin) | < 5 ms |
-| `TopK` refills/sec under an adversarial delete-the-top workload | < 5 |
+| Metric | Budget | Measured |
+|---|---|---|
+| p99 delta → committed frame | < 16 ms | 190 µs *(engine half only)* |
+| Engine steady-state RSS | < 60 MB | 6.3 MB anonymous |
+| `TopK` refills/sec under an adversarial delete-the-top workload | < 5 | 1.4 |
+| Decode of an initial 1000-row view (Dart *and* Kotlin) | < 5 ms | not yet measured |
+| APK growth per ABI | < 8 MB | not yet measured |
+
+Measured over 100k issues and 1M comments in real SQLite — **on a laptop, and only up
+to the point where the engine hands the diff over.** The FFI decode and the render are
+the other half of that first budget, and a desktop is not a phone. See
+[BENCHMARKS.md](BENCHMARKS.md) for what is and is not being claimed; the go/no-go gate
+is a physical Android device and it has not run yet.
 
 ## Repository
 
-Only `solstice-ivm` exists so far.
+Three crates so far, all of them M0 scaffolding.
 
 ```
-crates/solstice-ivm/    incremental view maintenance — no IO, no time, no threads
+crates/solstice-ivm/      incremental view maintenance — no IO, no time, no threads
+crates/solstice-store/    SQLite: schemas, bounded scans, the IR → SQL translation
+crates/solstice-bench/    the M0 kill criteria, measured
 ```
 
 The crate is organised around a single law, which its property tests check directly
@@ -84,9 +92,12 @@ for all plans P, relations R, deltas D:    P(R + D) == P(R) + P.apply(D)
 ```
 
 Maintaining a result incrementally and recomputing it from scratch must always agree.
+The law is checked against three oracles: a deliberately dumb reference evaluator,
+SQLite itself, and the incremental path.
 
 ```sh
-cargo test --workspace
+cargo test --workspace                    # the law, plus everything else
+cargo run --release -p solstice-bench     # the kill criteria, on your machine
 ```
 
 ## License

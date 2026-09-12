@@ -74,6 +74,32 @@ jobs:
           PROPTEST_CASES: "100000"
         run: cargo test --release -p solstice-store --test oracle
 
+  bench:
+    # The M0 harness, run small.
+    #
+    # Deliberately *not* a performance gate. A shared GitHub runner's timings
+    # are noise, and plan §9 puts the real gate on a physical Android device;
+    # asserting a millisecond budget here would only teach people to re-run red
+    # builds until they go green.
+    #
+    # What it does protect is real. The harness is what stands between the kill
+    # criteria and nobody noticing, so it must keep compiling and keep being
+    # runnable end to end. And every phase ends in `verify` — plan §6's second
+    # oracle — which re-asks SQLite the same question and fails the run if the
+    # incrementally maintained view has drifted. Two thousand transactions of
+    # that, on every push, is a correctness test the property suite cannot
+    # express: it is about drift over a long run on realistic data, not about a
+    # single delta obeying the law.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Harness end to end at tiny scale
+        run: >
+          cargo run --release -p solstice-bench --
+          --scale tiny --project 1 --k 20 --txns 2000
+
   determinism:
     # Five lines of grep protecting the one property everything else rests on.
     #

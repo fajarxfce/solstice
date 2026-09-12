@@ -28,5 +28,6 @@ pub mod ddl;
 pub mod sql;
 pub mod store;
 
+pub use ddl::{create_order_index, create_seek_index, create_table};
 pub use sql::{scan_sql, SqlScan};
 pub use store::{SqliteStore, StoreError};

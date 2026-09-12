@@ -10,7 +10,7 @@
 
 use crate::delta::Batch;
 use crate::graph::{Graph, GraphBuilder};
-use crate::operator::{OpCx, ScanRequest};
+use crate::operator::{OpCx, RefillKind, RefillStats, ScanRequest};
 use crate::ops::{Filter, Join1N, Project, Source, TopK};
 use crate::order::{cmp_entry, cmp_to_cursor, Dir};
 use crate::predicate::{Params, Predicate};
@@ -293,16 +293,14 @@ impl Reference {
 /// without SQLite — which is the whole reason the store is behind a trait.
 pub struct MemStore {
     tables: BTreeMap<TableId, Relation>,
-    pub refills: usize,
-    pub rows_refilled: usize,
+    pub refills: RefillStats,
 }
 
 impl MemStore {
     pub fn new() -> Self {
         MemStore {
             tables: BTreeMap::new(),
-            refills: 0,
-            rows_refilled: 0,
+            refills: RefillStats::default(),
         }
     }
 
@@ -311,8 +309,7 @@ impl MemStore {
     pub fn over(tables: &Tables) -> MemStore {
         MemStore {
             tables: tables.tables.clone(),
-            refills: 0,
-            rows_refilled: 0,
+            refills: RefillStats::default(),
         }
     }
 
@@ -358,9 +355,8 @@ impl OpCx for MemStore {
         rows
     }
 
-    fn note_refill(&mut self, rows: usize) {
-        self.refills += 1;
-        self.rows_refilled += rows;
+    fn note_refill(&mut self, kind: RefillKind, rows: usize) {
+        self.refills.note(kind, rows);
     }
 }
 
@@ -653,6 +649,6 @@ mod tests {
         let mut view = plan.eval(&base);
         view.apply(&out);
         assert_eq!(view, rel(&[(3, 30), (4, 40)]));
-        assert_eq!(store.refills, 1);
+        assert_eq!(store.refills.window, 1);
     }
 }

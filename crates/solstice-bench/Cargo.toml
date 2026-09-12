@@ -1,0 +1,16 @@
+[package]
+name = "solstice-bench"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "The M0 latency and memory harness: the kill criteria, measured."
+publish = false
+
+[dependencies]
+solstice-ivm = { path = "../solstice-ivm" }
+solstice-store = { path = "../solstice-store" }
+
+[[bin]]
+name = "solstice-bench"
+path = "src/main.rs"

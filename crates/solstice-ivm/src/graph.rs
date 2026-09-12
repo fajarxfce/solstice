@@ -195,6 +195,20 @@ impl Graph {
         self.nodes.iter().map(|n| n.op.state_bytes()).sum()
     }
 
+    /// Retained state per node, in topological order.
+    ///
+    /// The sum is [`Graph::state_bytes`]; *which* operator is holding it is the
+    /// part that tells you what to do about it. Plan §7 asks for per-operator
+    /// state size as a first-class metric from the first week, and a total
+    /// alone cannot distinguish a join fanning out from a window that grew its
+    /// slack — the first is a bug, the second is the design working.
+    pub fn state_report(&self) -> Vec<(&'static str, usize)> {
+        self.nodes
+            .iter()
+            .map(|n| (n.op.name(), n.op.state_bytes()))
+            .collect()
+    }
+
     pub fn len(&self) -> usize {
         self.nodes.len()
     }
@@ -345,6 +359,34 @@ mod tests {
 
         graph.hydrate(&mut store);
         assert!(graph.pump(&[], &mut store).is_empty());
+    }
+
+    #[test]
+    fn state_is_reported_per_operator_not_just_as_a_total() {
+        let mut store = MemStore::new();
+        store.load(ISSUES, rel(vec![row(1, 20), row(2, 30)]));
+
+        let mut b = GraphBuilder::new();
+        let src = b.source(ISSUES, Box::new(Source::new(ISSUES, 0)));
+        let topk = b.add(
+            Box::new(crate::ops::TopK::new(
+                ISSUES,
+                vec![(1, crate::order::Dir::Asc)],
+                2,
+            )),
+            vec![src],
+        );
+        let mut graph = b.build(topk);
+        graph.hydrate(&mut store);
+
+        let report = graph.state_report();
+        assert_eq!(report.len(), 2);
+        assert_eq!(report[0], ("Source", 0), "a source retains nothing");
+        assert!(report[1].1 > 0, "the window is holding two rows");
+        assert_eq!(
+            report.iter().map(|(_, b)| b).sum::<usize>(),
+            graph.state_bytes()
+        );
     }
 
     #[test]

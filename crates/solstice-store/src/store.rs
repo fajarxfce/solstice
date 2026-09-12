@@ -19,12 +19,13 @@
 //! doing it in this order — commit, then pump — which is what
 //! [`SqliteStore::commit`] exists to make explicit at the call site.
 
-use crate::ddl::{create_order_index, create_table};
+use crate::ddl::{create_seek_index, create_table};
 use crate::sql::scan_sql;
 use rusqlite::types::{ToSqlOutput, ValueRef};
 use rusqlite::{Connection, ToSql};
 use solstice_ivm::{
-    Batch, Change, ColId, Dir, OpCx, Row, RowKey, ScanRequest, Schema, TableId, Value,
+    Batch, Change, ColId, Dir, OpCx, RefillKind, RefillStats, Row, RowKey, ScanRequest, Schema,
+    TableId, Value,
 };
 use std::collections::BTreeMap;
 use std::path::Path;
@@ -95,8 +96,7 @@ fn from_sql(v: ValueRef<'_>) -> Value {
 pub struct SqliteStore {
     conn: Connection,
     schemas: BTreeMap<TableId, Schema>,
-    refills: usize,
-    rows_refilled: usize,
+    refills: RefillStats,
 }
 
 impl SqliteStore {
@@ -124,8 +124,7 @@ impl SqliteStore {
         let store = SqliteStore {
             conn,
             schemas: schemas.into_iter().map(|s| (s.table, s)).collect(),
-            refills: 0,
-            rows_refilled: 0,
+            refills: RefillStats::default(),
         };
         let schemas: Vec<Schema> = store.schemas.values().cloned().collect();
         for schema in &schemas {
@@ -135,13 +134,43 @@ impl SqliteStore {
     }
 
     /// Add the index that keeps refills on `order` bounded. See
-    /// [`create_order_index`].
+    /// [`create_order_index`](crate::ddl::create_order_index).
     pub fn index_order(&mut self, table: TableId, order: &[(ColId, Dir)]) -> Result<()> {
+        self.index_seek(table, &[], order)
+    }
+
+    /// Add the index for a scan that pins `eq` by equality before ordering by
+    /// `order`. See [`create_seek_index`].
+    pub fn index_seek(
+        &mut self,
+        table: TableId,
+        eq: &[ColId],
+        order: &[(ColId, Dir)],
+    ) -> Result<()> {
         let schema = self.schema(table)?;
-        if let Some(sql) = create_order_index(schema, order) {
+        if let Some(sql) = create_seek_index(schema, eq, order) {
             self.conn.execute(&sql, [])?;
         }
         Ok(())
+    }
+
+    /// SQLite's chosen plan for a scan, as `EXPLAIN QUERY PLAN` rows.
+    ///
+    /// The harness uses this to assert that a refill is a seek rather than a
+    /// table scan. "It was fast on my machine" is not the same claim: a scan of
+    /// a small table is fast too, and stops being fast at exactly the size
+    /// where nobody is watching.
+    pub fn explain(&self, req: &ScanRequest) -> Result<Vec<String>> {
+        let schema = self.schema(req.table)?;
+        let scan = scan_sql(schema, req);
+        let mut stmt = self
+            .conn
+            .prepare(&format!("EXPLAIN QUERY PLAN {}", scan.sql))?;
+        let binds: Vec<Bind<'_>> = scan.binds.iter().map(Bind).collect();
+        let rows = stmt
+            .query_map(rusqlite::params_from_iter(binds), |r| r.get::<_, String>(3))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
     }
 
     fn schema(&self, table: TableId) -> Result<&Schema> {
@@ -240,13 +269,12 @@ impl SqliteStore {
     /// This is the M0 kill criterion made observable: plan §5.1 budgets fewer
     /// than five `TopK` refills per second under an adversarial delete-the-top
     /// workload, and a number nobody can read is a budget nobody enforces.
-    pub fn refill_stats(&self) -> (usize, usize) {
-        (self.refills, self.rows_refilled)
+    pub fn refill_stats(&self) -> RefillStats {
+        self.refills
     }
 
     pub fn reset_refill_stats(&mut self) {
-        self.refills = 0;
-        self.rows_refilled = 0;
+        self.refills = RefillStats::default();
     }
 
     fn run_scan(&self, req: &ScanRequest) -> Result<Vec<(RowKey, Row)>> {
@@ -285,9 +313,8 @@ impl OpCx for SqliteStore {
         }
     }
 
-    fn note_refill(&mut self, rows: usize) {
-        self.refills += 1;
-        self.rows_refilled += rows;
+    fn note_refill(&mut self, kind: RefillKind, rows: usize) {
+        self.refills.note(kind, rows);
     }
 }
 
@@ -475,12 +502,21 @@ mod tests {
     #[test]
     fn refills_are_counted_so_the_kill_criterion_is_observable() {
         let mut s = store();
-        assert_eq!(s.refill_stats(), (0, 0));
-        s.note_refill(3);
-        s.note_refill(1);
-        assert_eq!(s.refill_stats(), (2, 4));
+        assert_eq!(s.refill_stats(), RefillStats::default());
+
+        s.note_refill(RefillKind::Window, 3);
+        s.note_refill(RefillKind::Children, 1);
+        s.note_refill(RefillKind::Children, 1);
+
+        // The kill criterion is about windows, so a busy join must not be able
+        // to inflate it — the two are counted apart, not summed.
+        let stats = s.refill_stats();
+        assert_eq!((stats.window, stats.window_rows), (1, 3));
+        assert_eq!((stats.children, stats.children_rows), (2, 2));
+        assert_eq!(stats.total(), 3);
+
         s.reset_refill_stats();
-        assert_eq!(s.refill_stats(), (0, 0));
+        assert_eq!(s.refill_stats(), RefillStats::default());
     }
 
     #[test]

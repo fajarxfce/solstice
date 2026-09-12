@@ -79,7 +79,64 @@ pub trait OpCx {
 
     /// Report that a bounded requery happened, so it surfaces in
     /// `stats.requeries_per_sec` instead of hiding as unexplained latency.
-    fn note_refill(&mut self, _rows: usize) {}
+    fn note_refill(&mut self, _kind: RefillKind, _rows: usize) {}
+}
+
+/// Which operator went back to the store, and therefore what a count of them
+/// means.
+///
+/// Both kinds are bounded reads, and adding them together would be a number
+/// about nothing: plan §5.1 budgets *`TopK` refills per second* specifically,
+/// because that is the one that can thrash. A [`RefillKind::Children`] read is
+/// the join doing its job — a parent entered the view and its children had to
+/// come from somewhere — and its rate is pinned to how often the window
+/// changes, not to how hard the window is working to stay full. Summing them
+/// makes a healthy join look like a failing window.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum RefillKind {
+    /// A [`TopK`](crate::ops::TopK) window fell below `k` and re-read the
+    /// relation below its boundary. Plan §7's degeneration shows up here as a
+    /// rate that climbs with the delete rate.
+    Window,
+    /// A [`Join1N`](crate::ops::Join1N) read the children of a parent that just
+    /// entered the view. Bounded by the child limit, which DQL makes mandatory
+    /// on a 1:N traversal (plan §1.1).
+    Children,
+}
+
+/// Bounded requeries, kept apart by [`RefillKind`].
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct RefillStats {
+    pub window: usize,
+    pub window_rows: usize,
+    pub children: usize,
+    pub children_rows: usize,
+}
+
+impl RefillStats {
+    pub fn note(&mut self, kind: RefillKind, rows: usize) {
+        match kind {
+            RefillKind::Window => {
+                self.window += 1;
+                self.window_rows += rows;
+            }
+            RefillKind::Children => {
+                self.children += 1;
+                self.children_rows += rows;
+            }
+        }
+    }
+
+    /// Every store read an operator made on its own initiative. Useful for "did
+    /// the pipeline touch the store at all", and useless as a kill criterion —
+    /// see [`RefillKind`].
+    pub fn total(&self) -> usize {
+        self.window + self.children
+    }
+
+    pub fn total_rows(&self) -> usize {
+        self.window_rows + self.children_rows
+    }
 }
 
 /// An [`OpCx`] for stateless operators, which never scan.

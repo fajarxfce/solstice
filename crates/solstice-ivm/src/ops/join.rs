@@ -31,7 +31,7 @@
 //! and without the fk it would pull in some other parent's comments.
 
 use crate::delta::{Batch, Change};
-use crate::operator::{Degrade, Inputs, OpCx, Operator, Port, ScanRequest};
+use crate::operator::{Degrade, Inputs, OpCx, Operator, Port, RefillKind, ScanRequest};
 use crate::ops::TopK;
 use crate::order::Dir;
 use crate::predicate::{CmpOp, Expr, Params, Predicate};
@@ -166,7 +166,7 @@ impl Join1N {
             params: self.params.clone(),
             limit: want,
         });
-        cx.note_refill(rows.len());
+        cx.note_refill(RefillKind::Children, rows.len());
 
         let batch: Batch = rows
             .into_iter()
