@@ -1,0 +1,17 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+#
+# Only seeds that caught a bug in *committed* code belong here. Proptest also
+# writes a seed for every failure produced while deliberately mutating the
+# source to check that these tests bite, and those are noise: they record
+# breakage that never shipped, and re-running them costs everyone time for a
+# case no version of this crate ever got wrong. They were removed by hand.
+
+# `substr()` on a zero-length blob returns NULL rather than an empty blob, so
+# a text value of "" came back unknown from a `LikePrefix` translation where
+# the engine says a plain true. Found on the 178th case of the very first run.
+cc 0b063cb048edb69488e5d47ddd7a49fed4023415f4ade6577e27498cca066020 # shrinks to rel = Relation { rows: {RowKey(Int(0)): Row { values: [Int(0), Null, Null, Null] }} }, order = [(0, Asc)], filter = Some(Not(Not(LikePrefix { lhs: Lit(Text("")), prefix: "" }))), params = Params([Null, Null]), page = 1

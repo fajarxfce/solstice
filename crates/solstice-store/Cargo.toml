@@ -1,0 +1,19 @@
+[package]
+name = "solstice-store"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "SQLite-backed canonical store for the Solstice local-first sync engine."
+
+[dependencies]
+solstice-ivm = { path = "../solstice-ivm" }
+# `bundled` compiles SQLite from the vendored C source. That is not a
+# convenience: it is what lets the same crate cross-compile to six mobile
+# targets without a system SQLite on each, which plan §7 names as the second
+# most underestimated risk in the project. It also pins the SQLite version, so
+# an OS upgrade cannot silently change query semantics under a client.
+rusqlite = { version = "0.40", features = ["bundled"] }
+
+[dev-dependencies]
+proptest = { workspace = true }

@@ -25,6 +25,23 @@ jobs:
       - run: cargo clippy --workspace --all-targets
       - run: cargo test --workspace
 
+  msrv:
+    # The declared `rust-version` compiled by the compiler it names.
+    #
+    # This job exists because the claim was wrong the moment it was written:
+    # the workspace said 1.80 while `indexmap` alone needed 1.85, and nothing
+    # would have noticed — the development toolchain is far newer, so the only
+    # person who would ever have found out is someone else, mid-build, reading
+    # an error about a dependency they had never heard of.
+    #
+    # An MSRV nobody compiles is not a floor, it is a rumour.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.85.0
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo check --workspace --all-targets
+
   sweep:
     # The delta law at depth, nightly.
     #
@@ -43,10 +60,19 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-      - name: Property sweep
+      - name: Delta law sweep
         env:
           PROPTEST_CASES: "1000000"
         run: cargo test --release -p solstice-ivm --test delta_law
+
+      # An order of magnitude shallower, because every case here compiles a
+      # statement and runs it against SQLite. Still deep enough to reach the
+      # cases that found the `substr` NULL and the blob round trip, which the
+      # per-commit 256 did not.
+      - name: SQLite oracle sweep
+        env:
+          PROPTEST_CASES: "100000"
+        run: cargo test --release -p solstice-store --test oracle
 
   determinism:
     # Five lines of grep protecting the one property everything else rests on.
