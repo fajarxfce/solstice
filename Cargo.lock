@@ -398,6 +398,7 @@ name = "solstice-bench"
 version = "0.0.1"
 dependencies = [
  "solstice-ivm",
+ "solstice-proto",
  "solstice-store",
 ]
 
@@ -408,6 +409,14 @@ dependencies = [
  "indexmap",
  "proptest",
  "smallvec",
+]
+
+[[package]]
+name = "solstice-proto"
+version = "0.0.1"
+dependencies = [
+ "proptest",
+ "solstice-ivm",
 ]
 
 [[package]]

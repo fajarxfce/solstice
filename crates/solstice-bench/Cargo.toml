@@ -10,6 +10,7 @@ publish = false
 [dependencies]
 solstice-ivm = { path = "../solstice-ivm" }
 solstice-store = { path = "../solstice-store" }
+solstice-proto = { path = "../solstice-proto" }
 
 [[bin]]
 name = "solstice-bench"

@@ -6,6 +6,15 @@
 /bench/out/
 /crates/solstice-sim/failures/
 
+# Spike S1 — all regenerable: fixtures from `s1-fixture`, decoders from
+# `generate.sh`. Committing generated protobuf code would let it drift from the
+# .proto it is supposed to be an independent check on.
+/spikes/s1-decode/fixtures/
+/spikes/s1-decode/dart/lib/gen/
+/spikes/s1-decode/dart/lib/gen32/
+/spikes/s1-decode/kotlin/gen/
+/spikes/s1-decode/kotlin/lib/
+
 # Dart / Flutter
 .dart_tool/
 .packages

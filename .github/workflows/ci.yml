@@ -100,6 +100,42 @@ jobs:
           cargo run --release -p solstice-bench --
           --scale tiny --project 1 --k 20 --txns 2000
 
+  abi:
+    # The wire format, checked by a decoder nobody here wrote.
+    #
+    # `solstice-proto`'s encoder is hand-written, so its own tests are a closed
+    # loop: they prove the encoder agrees with the decoder sitting next to it,
+    # which is exactly what a matched pair of bugs would also do. The check that
+    # means something is code `protoc` generated from the normative `.proto`,
+    # in another language, reading bytes Rust produced.
+    #
+    # Which only counts if it runs somewhere other than the author's laptop.
+    #
+    # Note what is *not* gated: the 5ms budget. The Dart decode fails it today
+    # (see spikes/s1-decode/README.md) and a shared runner's timings could not
+    # adjudicate that anyway — plan §9 puts the real gate on a physical device.
+    # What fails this job is the cross-check assertion: a drift between the
+    # encoder and the spec.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: dart-lang/setup-dart@v1
+      - run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
+      - run: dart pub global activate protoc_plugin
+
+      # Not a synthetic payload: a real hydration through real SQLite, so the
+      # row shapes that drive the decode cost come from the engine.
+      - name: Generate the fixture
+        run: cargo run --release -p solstice-bench --bin s1-fixture
+
+      - name: Generate the decoders from the normative .proto
+        run: ./spikes/s1-decode/generate.sh
+
+      - name: Rust encoder vs. generated Dart decoder
+        run: ./spikes/s1-decode/dart/run.sh
+
   determinism:
     # Five lines of grep protecting the one property everything else rests on.
     #

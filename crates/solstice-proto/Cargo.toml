@@ -1,0 +1,16 @@
+[package]
+name = "solstice-proto"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Protobuf encoding for the Solstice view diff — the payload that crosses FFI and the wire."
+
+[dependencies]
+solstice-ivm = { path = "../solstice-ivm" }
+
+[dev-dependencies]
+proptest = { workspace = true }
+
+[lints.rust]
+unsafe_code = "forbid"

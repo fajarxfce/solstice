@@ -1,0 +1,11 @@
+name: s1_decode
+description: Spike S1 — what a view diff costs to decode in Dart.
+publish_to: none
+
+environment:
+  sdk: ^3.5.0
+
+dependencies:
+  # The package `protoc --dart_out` generates against. Flutter apps pay for this
+  # too, so measuring anything else would measure a library nobody ships.
+  protobuf: ^6.1.0

@@ -1,0 +1,122 @@
+// The view diff: what a subscription emits, and the only shape that crosses FFI.
+//
+// Plan §1.2 asks for one artefact to serve the FFI transport, the wire protocol,
+// the cache key and the shape identity on the server. This file is the first
+// piece of it — the payload half. Query IR and mutations follow in M1/M2.
+//
+// # Why the ABI is bytes
+//
+// Plan §4.1: the ABI must not depend on the application's schema, or every app
+// would regenerate its own Rust FFI glue. So rows cross as protobuf bytes and
+// codegen produces typed accessors on the host side. The cost is a decode on
+// every delta, and that cost is spike S1 — the M0 kill criterion this file
+// exists to let us measure.
+//
+// # Stability
+//
+// None yet. Protocol version 0.x, unstable and loudly so (plan §3.5). Field
+// numbers are still free to move until the 1.0 freeze at M6, after which they
+// never move again.
+
+syntax = "proto3";
+
+package solstice.v1;
+
+// One class per message rather than one outer class holding all of them: the
+// Kotlin side imports `Added` and `ViewDelta` by name, and nesting them inside
+// a `ViewProto` wrapper buys nothing on a file this small.
+option java_package = "dev.solstice.proto.v1";
+option java_multiple_files = true;
+option java_outer_classname = "ViewProto";
+
+// A scalar, or a nested collection of child rows.
+//
+// The first five cases mirror SQLite's storage classes, because SQLite is the
+// durable store and the round trip has to be lossless. `rows` is the one that
+// does not, and it is the reason DQL results are hierarchies rather than
+// products: the delta a join emits when a child changes is an *update to the
+// parent row*, so the children have to live in a column of the parent.
+message Value {
+  // NULL is the *unset* oneof — a `Value` with no field at all, which is zero
+  // bytes of body. That is deliberate: a nullable column is exactly where nulls
+  // cluster, and paying a tag plus a varint to say "nothing" on every one of
+  // them is a cost with nothing to show for it.
+  // Field names here have to dodge the reserved words of *every* target
+  // language, because this one file is compiled to Rust, Dart, Kotlin and Java.
+  // `integer` rather than the obvious `int` is that rule being paid: `int` is a
+  // Dart keyword, and `protoc-gen-dart` renames around it by appending a
+  // disambiguator, so the accessor on the generated class comes out as `int_1`.
+  oneof kind {
+    // Zigzag rather than plain varint. Plain `int64` spends ten bytes on any
+    // negative number, and a general value type should not have a cliff at -1.
+    sint64 integer = 1;
+    double real = 2;
+    string text = 3;
+    bytes blob = 4;
+    RowList rows = 5;
+  }
+}
+
+// Exists only because proto3 forbids `repeated` inside a `oneof`.
+message RowList {
+  repeated Row rows = 1;
+}
+
+// Positional: column *i* of the row is the column the schema declares at index
+// *i*. Names are not on the wire. They are known to both ends from the schema
+// hash and repeating them 21,000 times per view would be most of the payload.
+message Row {
+  repeated Value values = 1;
+}
+
+// One row-level change, with the position it happened at.
+//
+// Positions are what make this worth sending instead of a snapshot: plan §1.5
+// fixes the diff API on day one precisely so `AnimatedList` and `LazyColumn`
+// get real item animations and stable scrolling. An engine that ships snapshots
+// first can never add this without breaking every app written against it.
+message ViewChange {
+  oneof change {
+    Added added = 1;
+    Removed removed = 2;
+    Changed changed = 3;
+    Moved moved = 4;
+  }
+}
+
+message Added {
+  uint32 index = 1;
+  Row row = 2;
+}
+
+// Carries the key, not the row: the host already has the row at `index`, and
+// the key is what lets it assert it is deleting the thing it thinks it is.
+message Removed {
+  uint32 index = 1;
+  Value key = 2;
+}
+
+message Changed {
+  uint32 index = 1;
+  Row row = 2;
+  // Which columns actually differ. A host that rebuilds a widget per changed
+  // field needs this; one that rebuilds the row can ignore it.
+  repeated uint32 cols = 3;
+}
+
+message Moved {
+  uint32 from = 1;
+  uint32 to = 2;
+}
+
+// A coherent batch for one subscription at one version.
+//
+// `version` is global across subscriptions, not per-subscription (plan §1.4): a
+// transaction touching five tables produces one graph pump, and every affected
+// view emits at the same version. That is what lets a host render five lists
+// without ever showing a torn read.
+message ViewDelta {
+  uint64 sub_id = 1;
+  uint64 version = 2;
+  repeated ViewChange changes = 3;
+}

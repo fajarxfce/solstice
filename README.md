@@ -65,23 +65,37 @@ fixed in advance and published as measured numbers, pass or fail:
 | p99 delta → committed frame | < 16 ms | 190 µs *(engine half only)* |
 | Engine steady-state RSS | < 60 MB | 6.3 MB anonymous |
 | `TopK` refills/sec under an adversarial delete-the-top workload | < 5 | 1.4 |
-| Decode of an initial 1000-row view (Dart *and* Kotlin) | < 5 ms | not yet measured |
+| Decode of an initial 1000-row view — Kotlin | < 5 ms | 1.65 ms |
+| Decode of an initial 1000-row view — Dart | < 5 ms | **6.14 ms — fails** |
 | APK growth per ABI | < 8 MB | not yet measured |
 
-Measured over 100k issues and 1M comments in real SQLite — **on a laptop, and only up
-to the point where the engine hands the diff over.** The FFI decode and the render are
-the other half of that first budget, and a desktop is not a phone. See
-[BENCHMARKS.md](BENCHMARKS.md) for what is and is not being claimed; the go/no-go gate
-is a physical Android device and it has not run yet.
+Measured over 100k issues and 1M comments in real SQLite — **on a laptop**, and the
+engine numbers only up to the point where it hands the diff over. A desktop is not a
+phone. See [BENCHMARKS.md](BENCHMARKS.md) for what is and is not being claimed; the
+go/no-go gate is a physical Android device and it has not run yet.
+
+**One criterion has already failed, and this is what that is for.** Dart decodes a
+1000-row view in 6.14 ms against a 5 ms budget. The cause is not the encoding — Dart
+walks those same bytes in 422 µs and indexes them in 8 µs — but `package:protobuf`
+materialising ~28,000 objects for a list that shows eight rows at a time. The plan
+named the fallback in advance (columnar diff + zero-copy accessors) and the
+measurement narrows it to half of that: the accessors, not the re-encoding. Kotlin
+passes as-is. Full diagnosis in [spikes/s1-decode](spikes/s1-decode/).
+
+Finding this in week three, before two demo apps were written on top of the wrong
+ABI, is the entire point of M0.
 
 ## Repository
 
-Three crates so far, all of them M0 scaffolding.
+Four crates so far, all of them M0 scaffolding.
 
 ```
+proto/solstice/v1/        the normative wire format
 crates/solstice-ivm/      incremental view maintenance — no IO, no time, no threads
 crates/solstice-store/    SQLite: schemas, bounded scans, the IR → SQL translation
+crates/solstice-proto/    protobuf encoding for the view diff — FFI payload and wire
 crates/solstice-bench/    the M0 kill criteria, measured
+spikes/s1-decode/         spike S1: what that payload costs to decode in Dart/Kotlin
 ```
 
 The crate is organised around a single law, which its property tests check directly

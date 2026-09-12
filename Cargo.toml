@@ -1,6 +1,11 @@
 [workspace]
 resolver = "2"
-members = ["crates/solstice-bench", "crates/solstice-ivm", "crates/solstice-store"]
+members = [
+    "crates/solstice-bench",
+    "crates/solstice-ivm",
+    "crates/solstice-proto",
+    "crates/solstice-store",
+]
 
 [workspace.package]
 version = "0.0.1"

@@ -23,7 +23,7 @@ plan's wording:
 |---|---|
 | p99 delta → **committed frame** | p99 delta → `pump` returned |
 | RSS on a **mid-range Android phone** | RSS on the machine named below |
-| Decode of a 1000-row view in Dart and Kotlin | — not yet; needs the FFI |
+| Decode of a 1000-row view in Dart and Kotlin | measured, on the same laptop — [spike S1](#spike-s1--ffi-decode-cost) |
 | APK size per ABI | — not yet |
 | Jank on a Pixel 6a | — not yet |
 
@@ -83,7 +83,8 @@ right one.
 | Engine operator state | < 60MB | **80.7 KB** | PASS |
 | Peak anonymous RSS | < 60MB | **6.3 MB** | PASS |
 | `TopK` refills/sec at 200 rows/sec | < 5 | **1.4** | PASS |
-| Decode of a 1000-row view (Dart, Kotlin) | < 5ms | not yet measured | — |
+| Decode of a 1000-row view — Kotlin | < 5ms | **1.65ms** | PASS |
+| Decode of a 1000-row view — Dart | < 5ms | **6.14ms** | **FAIL** |
 | APK size per ABI | < 8MB | not yet measured | — |
 
 Peak *total* RSS is 68.2 MB, of which 61.9 MB is SQLite's reclaimable `mmap`
@@ -172,12 +173,46 @@ The lesson for the planner, which M1 will have to encode: **an `ORDER BY` index
 is not enough for a query that also filters.** The equality columns have to come
 first, and the planner has to know which they are.
 
+## Spike S1 — FFI decode cost
+
+The other half of the `delta → frame` budget: plan §4.1 sends view diffs across
+FFI as protobuf bytes, and the host has to decode them. Full write-up and the
+diagnosis in [`spikes/s1-decode/`](spikes/s1-decode/); the summary is that **one
+of the two bindings fails**.
+
+The payload is a real hydration — 1000 parents, 3 children each, 21,000 scalars,
+266.4 KB — encoded by `solstice-proto` and read back by decoders `protoc`
+generated from the normative `.proto`.
+
+| | 1000-row view | 5-row delta | |
+|---|---|---|---|
+| Rust (`solstice-proto`) | 0.99ms | 4µs | control |
+| Kotlin, protobuf-javalite 4.36.1 | **1.65ms** | 8µs | PASS |
+| Dart 3.12.2 AOT, `package:protobuf` 6.1.0 | **6.14ms** | 31µs | **FAIL** |
+
+Deltas pass everywhere by two orders of magnitude, which is the steady state of a
+running app. The 5ms budget is about the first frame after a subscribe.
+
+**The encoding is not what fails.** Walking the same bytes and materialising
+nothing takes **422µs**; indexing 1000 row offsets takes **8µs**. 93% of Dart's
+6.14ms is building ~28,000 `GeneratedMessage` objects for a list that shows eight
+rows at a time. (`Int64` boxing from `package:fixnum` — the obvious suspect — was
+measured at 5% and rejected as the cause.)
+
+So plan §4.1's named fallback is right, and the measurement narrows it to half:
+**generated zero-copy accessors, without the columnar re-encoding.** Reordering
+bytes that already index in 8µs would solve nothing and would cost the shared
+encoding with the wire protocol. The `.proto` survives S1 unchanged.
+
+Kotlin is measured on HotSpot; Compose runs on ART. That pass is provisional in
+the same way every number here is.
+
 ## What this does not yet prove
 
-- Nothing has crossed an FFI boundary. Decode cost in Dart and Kotlin (spike S1)
-  is unmeasured, and it is the other half of the `delta → frame` budget.
 - Nothing has run on a phone. A desktop has more cache, faster storage and no
   competition for either.
+- S1 measured the decode, not the round trip. No bytes have yet crossed
+  `flutter_rust_bridge` or UniFFI, so the copy at the boundary is unmeasured.
 - Two phases of synthetic traffic are not eight months of a real app. The
   self-check makes the view *correct*; it does not make the workload
   *representative*.
