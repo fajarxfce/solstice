@@ -83,7 +83,7 @@ impl Operator for Source {
         let order = if self.order.is_empty() {
             // Scan in primary-key order by default. An unordered scan would be
             // marginally cheaper but would make hydration output depend on
-            // SQLite's physical layout, and `dq-ivm` is required to be
+            // SQLite's physical layout, and `solstice-ivm` is required to be
             // deterministic (plan §6).
             vec![(self.pk, Dir::Asc)]
         } else {

@@ -6,7 +6,7 @@
 //!
 //! This is oracle (a) of the three the plan calls for (§6): a reference
 //! evaluator over `Vec<Row>`, SQLite itself via `IR → SQL`, and the incremental
-//! path. Oracle (b) arrives with `dq-store`.
+//! path. Oracle (b) arrives with `solstice-store`.
 
 use crate::delta::{Batch, Change};
 use crate::operator::{Dir, OpCx, Operator, ScanRequest};
@@ -18,7 +18,7 @@ use std::collections::BTreeMap;
 /// A keyed set of rows.
 ///
 /// `BTreeMap` rather than `HashMap`: iteration order must be deterministic,
-/// which `dq-ivm` requires structurally (plan §6).
+/// which `solstice-ivm` requires structurally (plan §6).
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Relation {
     rows: BTreeMap<RowKey, Row>,
@@ -170,7 +170,7 @@ impl Reference {
 
 /// An in-memory [`OpCx`] backing `Source` hydration in tests.
 ///
-/// Stands in for `dq-store` so that `dq-ivm` can be exercised end to end
+/// Stands in for `solstice-store` so that `solstice-ivm` can be exercised end to end
 /// without SQLite — which is the whole reason the store is behind a trait.
 pub struct MemStore {
     tables: BTreeMap<u16, Relation>,

@@ -1,10 +1,10 @@
 [package]
-name = "dq-ivm"
+name = "solstice-ivm"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
-description = "Incremental view maintenance engine for the dq local-first sync engine."
+description = "Incremental view maintenance engine for the Solstice local-first sync engine."
 
 [dependencies]
 smallvec = { workspace = true }
@@ -14,6 +14,6 @@ indexmap = { workspace = true }
 proptest = { workspace = true }
 
 [lints.rust]
-# `dq-ivm` must contain no ambient nondeterminism (plan §6). These are the
+# `solstice-ivm` must contain no ambient nondeterminism (plan §6). These are the
 # imports that would smuggle it in; the CI lint job additionally greps for them.
 unsafe_code = "forbid"

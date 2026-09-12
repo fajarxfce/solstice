@@ -54,7 +54,7 @@ pub struct ScanRequest {
 /// Services an operator needs from the engine but cannot provide itself.
 ///
 /// Passing this in rather than letting operators hold a store handle is what
-/// keeps `dq-ivm` free of IO and time (plan §5), and therefore what makes the
+/// keeps `solstice-ivm` free of IO and time (plan §5), and therefore what makes the
 /// whole engine simulatable.
 pub trait OpCx {
     /// Run a bounded scan against the canonical store.
@@ -93,7 +93,7 @@ pub enum Degrade {
 }
 
 pub trait Operator: Send {
-    /// Stable name for stats, tracing, and `dq inspect`.
+    /// Stable name for stats, tracing, and `solstice inspect`.
     fn name(&self) -> &'static str;
 
     /// The incremental step: given an upstream delta, produce this operator's

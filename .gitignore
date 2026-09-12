@@ -4,7 +4,7 @@
 
 # Benchmark + simulation artefacts
 /bench/out/
-/crates/dq-sim/failures/
+/crates/solstice-sim/failures/
 
 # Dart / Flutter
 .dart_tool/

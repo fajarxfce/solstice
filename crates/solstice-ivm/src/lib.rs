@@ -1,4 +1,4 @@
-//! Incremental view maintenance for `dq`.
+//! Incremental view maintenance for Solstice.
 //!
 //! This crate answers one question: given a query and a stream of changes to
 //! the tables it reads, produce the stream of changes to its *result* — without
@@ -19,7 +19,7 @@
 //!
 //! # No IO, no time, no threads
 //!
-//! `dq-ivm` has no clock, no RNG, no filesystem, no sockets, and no threads.
+//! `solstice-ivm` has no clock, no RNG, no filesystem, no sockets, and no threads.
 //! Everything the engine needs from the outside world arrives through
 //! [`operator::OpCx`]. That is not tidiness: it is what makes the deterministic
 //! simulation tests possible (plan §6), and a CI lint enforces it.

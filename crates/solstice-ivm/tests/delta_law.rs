@@ -23,12 +23,12 @@
 //!   simply does not hold for those. Resolving edits makes every batch
 //!   well-formed by construction, so a failure is always a real one.
 
-use dq_ivm::delta::Change;
-use dq_ivm::operator::NoCx;
-use dq_ivm::predicate::{CmpOp, Expr, Params, Predicate};
-use dq_ivm::reference::{Reference, Relation, Stage};
-use dq_ivm::{Batch, ColId, Pipeline, Row, RowKey, Value};
 use proptest::prelude::*;
+use solstice_ivm::delta::Change;
+use solstice_ivm::operator::NoCx;
+use solstice_ivm::predicate::{CmpOp, Expr, Params, Predicate};
+use solstice_ivm::reference::{Reference, Relation, Stage};
+use solstice_ivm::{Batch, ColId, Pipeline, Row, RowKey, Value};
 use std::sync::Arc;
 
 /// Width of the generated base relation.

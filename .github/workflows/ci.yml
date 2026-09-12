@@ -1,0 +1,54 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: -D warnings
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo fmt --all --check
+      - run: cargo clippy --workspace --all-targets
+      - run: cargo test --workspace
+
+  determinism:
+    # Five lines of grep protecting the one property everything else rests on.
+    #
+    # `solstice-ivm` must contain no ambient nondeterminism: no clock, no RNG, no
+    # threads, no IO, and no dependence on `HashMap` iteration order. Every such
+    # dependency is injected through `OpCx` instead.
+    #
+    # Without this, determinism erodes one innocuous `Instant::now()` at a time,
+    # and the deterministic simulation tests — the only tool that can find the
+    # convergence bugs this project is most likely to ship — stop working. It is
+    # far cheaper to enforce than to restore.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Reject ambient nondeterminism in solstice-ivm
+        run: |
+          set -uo pipefail
+          banned='std::time|SystemTime|Instant::now|use rand|rand::|thread::spawn|std::fs|std::net|HashMap<|HashMap::|collections::HashMap'
+          # Doc comments name these types when explaining why they are banned,
+          # so strip comment lines before matching.
+          hits=$(grep -rnE "$banned" crates/solstice-ivm/src \
+                 | grep -vE '^[^:]+:[0-9]+: *(//|/\*|\*)' || true)
+          if [ -n "$hits" ]; then
+            echo "$hits"
+            echo
+            echo "::error::solstice-ivm must stay deterministic. Inject clocks, randomness"
+            echo "and IO through OpCx; use IndexMap or BTreeMap instead of HashMap."
+            exit 1
+          fi
+          echo "solstice-ivm is clean."
