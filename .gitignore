@@ -1,0 +1,26 @@
+# Rust
+/target/
+**/*.rs.bk
+
+# Benchmark + simulation artefacts
+/bench/out/
+/crates/dq-sim/failures/
+
+# Dart / Flutter
+.dart_tool/
+.packages
+build/
+*.iml
+
+# Kotlin / Gradle
+.gradle/
+local.properties
+.kotlin/
+
+# Editors
+.idea/
+.vscode/
+*.swp
+
+# OS
+.DS_Store

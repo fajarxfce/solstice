@@ -1,0 +1,27 @@
+[workspace]
+resolver = "2"
+members = ["crates/dq-ivm"]
+
+[workspace.package]
+version = "0.0.1"
+edition = "2021"
+rust-version = "1.80"
+license = "Apache-2.0"
+
+[workspace.dependencies]
+smallvec = "1"
+indexmap = "2"
+proptest = "1"
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+
+# Mobile release profile: size matters more than the last 5% of speed.
+# M0 kill criterion is < 8MB APK growth per ABI (see plan §5.1).
+[profile.mobile]
+inherits = "release"
+opt-level = "z"
+panic = "abort"
+strip = "symbols"
