@@ -24,7 +24,7 @@ plan's wording:
 | p99 delta → **committed frame** | p99 delta → `pump` returned |
 | RSS on a **mid-range Android phone** | RSS on the machine named below |
 | Decode of a 1000-row view in Dart and Kotlin | measured, on the same laptop — [spike S1](#spike-s1--ffi-decode-cost) |
-| APK size per ABI | — not yet |
+| APK size per ABI | the cdylib's size, built for x86-64 — [spike S2](#spike-s2--the-boundary-itself) |
 | Jank on a Pixel 6a | — not yet |
 
 So a number inside budget here is **necessary, not sufficient**. A number
@@ -86,7 +86,7 @@ right one.
 | Decode of a 1000-row view — Kotlin | < 5ms | **1.65ms** | PASS |
 | Decode of a 1000-row view — Dart, `package:protobuf` | < 5ms | **6.14ms** | **FAIL** |
 | Decode of a 1000-row view — Dart, zero-copy accessor | < 5ms | **8.30µs** | PASS |
-| APK size per ABI | < 8MB | not yet measured | — |
+| APK size per ABI | < 8MB | 1.9–2.0 MB of cdylib, x86-64 | — |
 
 Peak *total* RSS is 68.2 MB, of which 61.9 MB is SQLite's reclaimable `mmap`
 window over an 89 MB database. Those pages are clean and file-backed: the kernel
@@ -231,12 +231,73 @@ and the accessor all agree on the correct values. A SQLite column holds an `i64`
 so a real row may carry these, and the failure is silent. Details and the
 reproduction in [`spikes/s1-decode/`](spikes/s1-decode/).
 
+## Spike S2 — the boundary itself
+
+S1 decoded bytes without crossing FFI. S2 crosses it: two adapter crates, two
+generated bindings, two host benchmarks, one engine. Full write-up in
+[`spikes/s2-bridge/`](spikes/s2-bridge/).
+
+Rust is the control — the same engine called in-process, so a host's column minus
+Rust's is what the binding charges.
+
+| | rust | dart | kotlin |
+|---|---|---|---|
+| `initial()` k=1000 — 266.4 KB | 7µs | **532µs** | **194µs** |
+| `subId()` — no payload at all | — | **<1µs** | **7µs** |
+| `initial()` k=50 — 13.3 KB | 137ns | 17µs | 21µs |
+| `mutate` — no sink installed | 385µs | 388µs | 422µs |
+| `mutate` — 1 update, 2 views live | 386µs | 411µs | **516µs** |
+| `mutate` → delta arrives at the host | — | 409µs | 524µs |
+
+**The boundary charges per byte, not per call.** Dart's per-call floor is under a
+microsecond and its 266.4 KB payload is 532µs. Neither binding moves bytes at
+memory speed — ~0.5 GB/s on Dart, ~1.4 GB/s on Kotlin, against 38 GB/s for the
+Rust clone — because both copy twice. An ABI of few large calls is therefore the
+right shape, which is what plan §4.1 already chose; now for a measured reason.
+
+**Put S1 and S2 together and the first frame comes in under budget, but the copy
+becomes the whole cost.** Dart today is 532µs + 6.29ms = 6.82ms, over. With S1's
+zero-copy accessor it is 532µs + 8µs = **540µs**, 9× under — and 98% of that is
+`flutter_rust_bridge` copying a buffer. Kotlin needs nothing: 194µs + 1.64ms =
+1.8ms.
+
+**The callback is where the two generators genuinely differ.** `mutate` measured
+with and without a sink installed isolates it, since `Engine::pump` maintains
+every view either way. Ranges below are two full runs:
+
+| `mutate`, 2 deltas per write | no sink | with sink | delivery |
+|---|---|---|---|
+| Rust — virtual call into a counter | 385–394µs | 386–403µs | in the noise |
+| Dart — FRB `StreamSink`, posts to the isolate's port | 388–414µs | 411–420µs | in the noise |
+| Kotlin — UniFFI foreign trait, upcall into the JVM via JNA | 421–422µs | 515–516µs | **+94µs** |
+
+UniFFI's callback is synchronous and runs on the engine thread, so it lands in
+every writer's latency — 47µs per delta, reproducible to the microsecond, making
+Kotlin's write path 22% slower with a sink than without. Dart's and Rust's cost
+less than the measurement's own run-to-run spread. That makes plan §4.3's
+"`trySend` and get out" load-bearing rather than advisory, and makes per-pump
+batching (plan §4.2's one stream per `Database`) the Kotlin fix rather than a
+nicety.
+
+**An early read on the APK budget.** With SQLite 3.53 bundled, under the `mobile`
+profile (`opt-level=z`, `panic=abort`, stripped): **2.0 MB** for the Dart cdylib,
+**1.9 MB** for the Kotlin one. x86-64 Linux, so an indication and not a
+measurement, but the < 8MB budget is not obviously in danger.
+
+**Two generator asymmetries, found by compiling the generated code.** UniFFI 0.32
+cannot express an error field named `message` — it emits `val message` and
+`override val message` in one class, and `kotlinc` rejects it; both adapters now
+spell it `detail`. And `flutter_rust_bridge` renders a Rust enum-with-fields as a
+`freezed` sealed class, so `build_runner` is part of any Flutter consumer's build
+where UniFFI needs nothing extra.
+
 ## What this does not yet prove
 
 - Nothing has run on a phone. A desktop has more cache, faster storage and no
-  competition for either.
-- S1 measured the decode, not the round trip. No bytes have yet crossed
-  `flutter_rust_bridge` or UniFFI, so the copy at the boundary is unmeasured.
+  competition for either. Kotlin is measured on HotSpot, and the JNA upcall S2
+  makes so much of is one of the things most likely to differ on ART.
+- S2 stops at the host, not at the frame. `mutate → delta at the host` is not
+  `delta → committed frame`; nothing here has laid out a list.
 - Two phases of synthetic traffic are not eight months of a real app. The
   self-check makes the view *correct*; it does not make the workload
   *representative*.

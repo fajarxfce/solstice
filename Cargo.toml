@@ -3,6 +3,8 @@ resolver = "2"
 members = [
     "crates/solstice-bench",
     "crates/solstice-core",
+    "crates/solstice-ffi-dart",
+    "crates/solstice-ffi-kotlin",
     "crates/solstice-ivm",
     "crates/solstice-proto",
     "crates/solstice-store",

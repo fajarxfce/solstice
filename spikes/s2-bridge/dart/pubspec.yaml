@@ -1,0 +1,30 @@
+name: s2_bridge
+description: Spike S2 — what the FFI boundary costs on the Dart side.
+publish_to: none
+
+environment:
+  sdk: ^3.5.0
+
+dependencies:
+  # The runtime half of flutter_rust_bridge. Pinned to the exact version the
+  # generator ran at: the generated Dart and the generated Rust agree on a
+  # protocol, and a version skew between them is a runtime failure, not a
+  # compile error.
+  flutter_rust_bridge: 2.14.0-beta.2
+  # What `protoc --dart_out` generates against, and what a Flutter app pays for.
+  protobuf: ^6.1.0
+  # Not a choice. `flutter_rust_bridge` renders a Rust enum-with-fields — here,
+  # `SolsticeError` — as a freezed sealed class, so a second Dart codegen pass
+  # is part of the build. UniFFI needs nothing extra for the same enum. That
+  # asymmetry is a finding, not an inconvenience; see the spike README.
+  freezed_annotation: ^3.1.0
+  # `Int64` — every 64-bit protobuf field lands here, since Dart compiled to
+  # JavaScript has no 64-bit integer. S1 measured what that costs (5%, and not
+  # the reason Dart was slow).
+  fixnum: ^1.1.1
+  # `StreamQueue`, for awaiting exactly two deltas per write without racing.
+  async: ^2.11.0
+
+dev_dependencies:
+  build_runner: ^2.4.0
+  freezed: ^3.2.0

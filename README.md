@@ -67,7 +67,7 @@ fixed in advance and published as measured numbers, pass or fail:
 | `TopK` refills/sec under an adversarial delete-the-top workload | < 5 | 1.4 |
 | Decode of an initial 1000-row view — Kotlin | < 5 ms | 1.65 ms |
 | Decode of an initial 1000-row view — Dart | < 5 ms | **6.14 ms — fails**, 8.30 µs with the fallback |
-| APK growth per ABI | < 8 MB | not yet measured |
+| APK growth per ABI | < 8 MB | 1.9–2.0 MB of cdylib, x86-64 — not an APK yet |
 
 Measured over 100k issues and 1M comments in real SQLite — **on a laptop**, and the
 engine numbers only up to the point where it hands the diff over. A desktop is not a
@@ -87,17 +87,33 @@ eager decode. The `.proto` does not change. Kotlin passes as-is. Full write-up i
 Finding this in week three, before two demo apps were written on top of the wrong
 ABI, is the entire point of M0.
 
+**The other half of that question is now answered: the byte ABI works, from both
+sides.** Dart and Kotlin each build a query themselves, hand the engine bytes, and
+get a view back — and neither Rust adapter knows this application has a table called
+`issues`, which is the property the whole three-crate split exists for. What the
+boundary costs is **bytes, not calls**: a payload-free call is under a microsecond in
+Dart, while 266 KB costs 532 µs. Put that next to S1 and the Dart first frame lands at
+540 µs once the accessor replaces the eager decode — 9× under budget, with 98% of it
+now being `flutter_rust_bridge` copying a buffer. The one place the two generators
+genuinely diverge is the callback: UniFFI's is a synchronous upcall on the engine
+thread and makes a write 22% slower, where Dart's `StreamSink` posts and returns. Full
+write-up in [spikes/s2-bridge](spikes/s2-bridge/).
+
 ## Repository
 
-Four crates so far, all of them M0 scaffolding.
+All of it M0 scaffolding.
 
 ```
 proto/solstice/v1/        the normative wire format
 crates/solstice-ivm/      incremental view maintenance — no IO, no time, no threads
 crates/solstice-store/    SQLite: schemas, bounded scans, the IR → SQL translation
 crates/solstice-proto/    protobuf encoding for the view diff — FFI payload and wire
+crates/solstice-core/     the engine thread behind the byte ABI — zero FFI attributes
+crates/solstice-ffi-dart/ the flutter_rust_bridge adapter — wrapping, no logic
+crates/solstice-ffi-kotlin/ the UniFFI adapter, deliberately the same shape
 crates/solstice-bench/    the M0 kill criteria, measured
 spikes/s1-decode/         spike S1: what that payload costs to decode in Dart/Kotlin
+spikes/s2-bridge/         spike S2: what the boundary itself costs, both bindings
 ```
 
 The crate is organised around a single law, which its property tests check directly

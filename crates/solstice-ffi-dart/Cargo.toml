@@ -1,0 +1,31 @@
+[package]
+name = "solstice-ffi-dart"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "flutter_rust_bridge adapter: the Solstice byte ABI as a Dart library."
+publish = false
+
+[lib]
+crate-type = ["cdylib", "lib"]
+name = "solstice_ffi_dart"
+
+[dependencies]
+solstice-core = { path = "../solstice-core" }
+flutter_rust_bridge = { version = "=2.14.0-beta.2", features = ["rust-async"] }
+
+[dev-dependencies]
+solstice-ivm = { path = "../solstice-ivm" }
+solstice-proto = { path = "../solstice-proto" }
+
+# See the note in `solstice-ffi-kotlin/Cargo.toml`: the generated bridge is
+# `extern "C"` by nature, and confining the unsafe to the two adapter crates is
+# what makes forbidding it in the other five mean something.
+[lints.rust]
+unsafe_code = "allow"
+# `#[frb(...)]` expands to code guarded by `cfg(frb_expand)`, a cfg the generator
+# sets when it reads this crate and nobody sets when it is compiled. Declaring it
+# here tells rustc the name is known, which is the truth — without it every
+# annotated item raises `unexpected_cfgs` and CI builds with `-D warnings`.
+unexpected_cfgs = { level = "warn", check-cfg = ["cfg(frb_expand)"] }

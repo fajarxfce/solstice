@@ -15,6 +15,20 @@
 /spikes/s1-decode/kotlin/gen/
 /spikes/s1-decode/kotlin/lib/
 
+# Spike S2 — same rule, one exception. Everything four generators write into the
+# spike is regenerable by `generate.sh` and stays out; the jars `kotlin/run.sh`
+# fetches stay out with them.
+#
+# The exception is `crates/solstice-ffi-dart/src/frb_generated.rs`, which is
+# committed: it is a module of a workspace crate, so without it `cargo build`
+# fails for anyone who has not installed `flutter_rust_bridge_codegen`. Its Dart
+# counterpart is ignored anyway — the two are written by one run of the
+# generator, so they cannot drift apart.
+/spikes/s2-bridge/dart/lib/gen/
+/spikes/s2-bridge/dart/lib/src/rust/
+/spikes/s2-bridge/kotlin/gen/
+/spikes/s2-bridge/kotlin/lib/
+
 # Dart / Flutter
 .dart_tool/
 .packages

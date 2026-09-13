@@ -1,0 +1,39 @@
+[package]
+name = "solstice-ffi-kotlin"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "UniFFI adapter: the Solstice byte ABI as a Kotlin/JVM library."
+publish = false
+
+[lib]
+# `cdylib` is what Android and the JVM load; `lib` keeps the crate testable
+# from Rust and lets the bindgen binary below link it as a dependency.
+crate-type = ["cdylib", "lib"]
+name = "solstice_ffi_kotlin"
+
+[dependencies]
+solstice-core = { path = "../solstice-core" }
+uniffi = { version = "0.32", features = ["cli"] }
+
+# Generating bindings from a binary *inside this crate* rather than from a
+# globally installed `uniffi-bindgen`. The generator has to read the same
+# version of the metadata the library wrote, and a tool installed separately
+# drifts from the library on its own schedule — a mismatch that shows up as a
+# checksum failure at runtime rather than a build error.
+[[bin]]
+name = "uniffi-bindgen"
+path = "src/bin/uniffi-bindgen.rs"
+
+[dev-dependencies]
+solstice-ivm = { path = "../solstice-ivm" }
+solstice-proto = { path = "../solstice-proto" }
+
+# `unsafe_code` is forbidden in every other crate in this workspace and cannot
+# be here: UniFFI's scaffolding is `extern "C"` functions handing raw pointers
+# across the boundary, which is the entire job of this crate. Keeping the ban
+# everywhere else is what makes that bounded — the unsafe lives in generated
+# code, in one file, written by a generator with more eyes on it than this repo.
+[lints.rust]
+unsafe_code = "allow"

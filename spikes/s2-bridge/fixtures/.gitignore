@@ -1,0 +1,10 @@
+# The seeded world is 17MB and reproducible in under a second:
+#
+#     cargo run --release -p solstice-bench --bin s2-fixture
+#
+# The small files beside it are committed, because they are the cross-check: a
+# host that builds a different query IR than `query-1000.bin` is measuring a
+# different query.
+s2.db
+s2.db-wal
+s2.db-shm
