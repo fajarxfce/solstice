@@ -1,0 +1,10 @@
+# The app's own copy of the bridge.
+#
+# `crates/solstice-ffi-dart/flutter_rust_bridge.yaml` points its `dart_output`
+# at spike S2. Rather than move it, the app carries a second config with the
+# same inputs and a different Dart destination: the generator is deterministic,
+# both runs write the identical `src/frb_generated.rs`, and the spike keeps
+# working without depending on the app or the app on the spike.
+rust_input: crate::api
+rust_root: ../../crates/solstice-ffi-dart
+dart_output: lib/src/rust

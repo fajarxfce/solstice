@@ -92,19 +92,30 @@ pub struct Churn {
     /// work rather than the case that lets it ignore the delta.
     now: i64,
     in_project: Vec<i64>,
+    open_in_project: usize,
 }
 
 impl Churn {
     pub fn new(store: &mut SqliteStore, scale: Scale, q: &Query, bias: u64, seed: u64) -> Churn {
-        let in_project = store
-            .scan(&ScanRequest {
-                table: ISSUES,
-                order: Vec::new(),
-                after: None,
-                filter: Some(Predicate::eq(issue::PROJECT, q.project)),
-                params: Params::empty(),
-                limit: scale.issues,
-            })
+        // Every issue in the project, open or not: reopening a closed one is
+        // part of ordinary traffic, so the pick set is deliberately wider than
+        // what the view can see.
+        let rows = store.scan(&ScanRequest {
+            table: ISSUES,
+            order: Vec::new(),
+            after: None,
+            filter: Some(Predicate::eq(issue::PROJECT, q.project)),
+            params: Params::empty(),
+            limit: scale.issues,
+        });
+        // Counted in the same pass, because it is the number that says whether
+        // the window has anything below it — and the two are easy to confuse,
+        // which is exactly what happened once in `BENCHMARKS.md`.
+        let open_in_project = rows
+            .iter()
+            .filter(|(_, row)| row.get(issue::CLOSED) == &Value::Int(0))
+            .count();
+        let in_project = rows
             .into_iter()
             .filter_map(|(k, _)| match k.value() {
                 Value::Int(i) => Some(*i),
@@ -121,14 +132,20 @@ impl Churn {
             next_comment: scale.comments() as i64,
             now: 2_000_001,
             in_project,
+            open_in_project,
         }
     }
 
-    /// Issues the subscribed query can see. Empty means the fixture generated
-    /// nothing for this project, which would make every measurement below
-    /// meaningless.
-    pub fn subscribed_issues(&self) -> usize {
+    /// Every issue in the project, which is the set mutations are aimed at.
+    pub fn issues_in_project(&self) -> usize {
         self.in_project.len()
+    }
+
+    /// The subset the subscribed query can actually see — `closed = 0`. This is
+    /// the one the window's candidates come from, so it is the one a sanity
+    /// check has to be written against.
+    pub fn open_in_project(&self) -> usize {
+        self.open_in_project
     }
 
     fn pick_issue(&mut self) -> i64 {
@@ -314,7 +331,7 @@ mod tests {
     fn churn_produces_transactions_that_touch_more_than_one_table() {
         let mut s = store();
         let mut churn = Churn::new(&mut s, Scale::TINY, &query(), 25, 5);
-        assert!(churn.subscribed_issues() > 0);
+        assert!(churn.issues_in_project() > 0);
 
         let mut saw_multi_table = false;
         let mut mutations = 0;

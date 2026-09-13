@@ -50,8 +50,8 @@ Solstice targets that gap directly:
 
 ## Is this even possible?
 
-That is what M0 exists to answer, and the answer is in for the engine but not for the
-frame. The question:
+That is what M0 exists to answer. For Flutter the answer is now in, end to end,
+and it is a qualified no. The question:
 
 > Can a Rust IVM engine behind a schema-independent byte ABI deliver sub-16ms,
 > jank-free updates for a **joined, sorted, limited** list over a 100k-row local
@@ -63,18 +63,18 @@ fixed in advance and published as measured numbers, pass or fail:
 
 | Metric | Budget | Measured |
 |---|---|---|
-| p99 delta → committed frame | < 16 ms | 437 µs on a phone *(engine half only)* |
+| p99 delta → committed frame, Flutter | < 16 ms | **23.4 ms — fails.** 24 µs of it is this engine |
+| Jank under continuous churn | not visible | 0.8% of frames over 16 ms |
 | Engine steady-state RSS | < 60 MB | 6.6 MB anonymous, on a phone |
 | `TopK` refills/sec under an adversarial delete-the-top workload | < 5 | 1.4 |
-| Decode of an initial 1000-row view — Kotlin | < 5 ms | 1.65 ms |
-| Decode of an initial 1000-row view — Dart | < 5 ms | **6.14 ms — fails**, 8.30 µs with the fallback |
+| Decode of an initial 1000-row view — Kotlin | < 5 ms | 1.65 ms *(on a laptop)* |
+| Decode of an initial 1000-row view — Dart | < 5 ms | **6.14 ms — fails**, 137 µs on the phone with the fallback |
 | APK growth per ABI | < 8 MB | 1.73–1.84 MB of cdylib, arm64-v8a |
 
-Measured over 100k issues and 1M comments in real SQLite. The engine rows now come
-from a physical phone — a Galaxy A72, deliberately slower than the Pixel 6a the plan
-names — and the decode rows still come from a laptop. Every one of them stops where
-the engine hands the diff over, which is not where a frame is. See
-[BENCHMARKS.md](BENCHMARKS.md) for what is and is not being claimed.
+Measured over 100k issues and 1M comments in real SQLite, on a Galaxy A72 —
+deliberately slower than the Pixel 6a the plan names. Everything except the Kotlin
+row now comes from that phone. See [BENCHMARKS.md](BENCHMARKS.md) for what is and is
+not being claimed.
 
 **One criterion has already failed, and this is what that is for.** Dart decodes a
 1000-row view in 6.14 ms against a 5 ms budget. The cause is not the encoding — Dart
@@ -112,6 +112,23 @@ engine thread**. Nothing in the criteria fails — p99 is 437 µs against 16 ms 
 21 ms is a dropped frame and a half, and it was invisible on a desktop. Diagnosed
 now, fixed in M1. Full write-up in [spikes/s3-android](spikes/s3-android/).
 
+**The headline criterion fails, and the decomposition says the engine is 0.1% of the
+miss.** A Flutter app over the same 89 MB fixture, with a driver mutating 200 rows/sec,
+puts a change on the glass in **23.4 ms at p99** against a 16 ms budget. Cut into the
+three legs it is made of: **24 µs** to turn FFI bytes into indexed rows, 12.5 ms
+waiting for the scheduler and the next vsync, 14.1 ms for Flutter to build and
+rasterize. Making the engine faster cannot fix this — the budget would still be
+missed if `apply` were free. On a 90 Hz panel, 16 ms is 1.44 refresh intervals, and a
+delta that arrives at an arbitrary moment waits up to one of them before a build can
+even start. That is an explanation, not an excuse: the number stays a failure, and
+what it redirects is *where to look* — at frame scheduling, not at the byte ABI.
+Jank, separately, is fine: 0.8% of frames over 16 ms under continuous churn, with the
+list correct after every one of 5,520 deltas. Full write-up in
+[examples/flutter-issues](examples/flutter-issues/).
+
+Compose has not answered the same question yet, and nothing here licenses assuming it
+transfers.
+
 ## Repository
 
 All of it M0 scaffolding.
@@ -125,6 +142,7 @@ crates/solstice-core/     the engine thread behind the byte ABI — zero FFI att
 crates/solstice-ffi-dart/ the flutter_rust_bridge adapter — wrapping, no logic
 crates/solstice-ffi-kotlin/ the UniFFI adapter, deliberately the same shape
 crates/solstice-bench/    the M0 kill criteria, measured
+examples/flutter-issues/  the Flutter demo — where delta → frame is measured
 spikes/s1-decode/         spike S1: what that payload costs to decode in Dart/Kotlin
 spikes/s2-bridge/         spike S2: what the boundary itself costs, both bindings
 spikes/s3-android/        spike S3: size per ABI, and the kill criteria on a real phone

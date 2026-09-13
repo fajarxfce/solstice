@@ -1,0 +1,46 @@
+name: flutter_issues
+description: >
+  Plan §5.1's Flutter half of M0 — a scrolling list over 100k issues while a
+  background thread mutates 200 rows a second, measuring delta → committed frame.
+publish_to: none
+version: 0.1.0+1
+
+environment:
+  sdk: ^3.12.2
+
+dependencies:
+  flutter:
+    sdk: flutter
+
+  # Pinned to the exact version `generate.sh` runs the generator at. The
+  # generated Dart and the generated Rust agree on a protocol and a checksum,
+  # so a version skew between them is a runtime failure, not a compile error.
+  flutter_rust_bridge: 2.14.0-beta.2
+
+  # What the byte ABI is made of. The app decodes `ViewDelta` and encodes
+  # `Query`/`Mutation`; plan §4.1's point is that the FFI signatures never
+  # mention any of it.
+  protobuf: ^6.1.0
+  fixnum: ^1.1.1
+
+  # `flutter_rust_bridge` renders `SolsticeError` — a Rust enum with fields —
+  # as a freezed sealed class, so freezed is a build dependency of anything
+  # that links the bridge. Recorded as a finding in spike S2.
+  freezed_annotation: ^3.1.0
+
+  # The only plugin, and only to find one directory: the app's own external
+  # files directory, which is where `push-fixture.sh` puts the seeded world
+  # because `adb push` can reach it and the app can read it without asking for
+  # a permission. Hardcoding `/sdcard/Android/data/<pkg>/files` would work
+  # today and be wrong on the first device that disagrees.
+  path_provider: ^2.1.0
+
+dev_dependencies:
+  flutter_test:
+    sdk: flutter
+  flutter_lints: ^6.0.0
+  build_runner: ^2.4.0
+  freezed: ^3.2.0
+
+flutter:
+  uses-material-design: true

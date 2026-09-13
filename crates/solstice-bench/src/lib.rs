@@ -129,7 +129,8 @@ impl Phase {
 pub struct Report {
     pub seed_elapsed: Duration,
     pub db_bytes: Option<u64>,
-    pub subscribed_issues: usize,
+    pub issues_in_project: usize,
+    pub open_in_project: usize,
     pub hydrate_limit: usize,
     pub hydration: Hydration,
     pub phases: Vec<Phase>,
@@ -170,16 +171,19 @@ impl From<StoreError> for BenchError {
 /// table of passes produced that way is worse than no table, because it would be
 /// published. The two ways to get one by accident are asking for a project that
 /// the scale never generated, and asking for a window wider than the data.
-fn check(cfg: &Config, subscribed: usize) -> Result<(), BenchError> {
+fn check(cfg: &Config, open: usize) -> Result<(), BenchError> {
     if cfg.query.project < 0 || cfg.query.project >= cfg.scale.projects {
         return Err(BenchError::Misconfigured(format!(
             "project {} does not exist: this scale generates projects 0..{}",
             cfg.query.project, cfg.scale.projects
         )));
     }
-    if subscribed < cfg.query.k {
+    // Open issues, not issues: the filter is `project = $0 AND closed = 0`, so a
+    // project full of closed issues would pass a check written against the
+    // wider count and still starve the window.
+    if open < cfg.query.k {
         return Err(BenchError::Misconfigured(format!(
-            "project {} has {subscribed} open issues and the window holds {}, so the \
+            "project {} has {open} open issues and the window holds {}, so the \
              window is never full and never refills — nothing here would be measured",
             cfg.query.project, cfg.query.k
         )));
@@ -229,8 +233,9 @@ pub fn run(cfg: &Config) -> Result<Report, BenchError> {
         cfg.bias,
         cfg.seed ^ 0x00C0_FFEE,
     );
-    let subscribed_issues = churn.subscribed_issues();
-    check(cfg, subscribed_issues)?;
+    let issues_in_project = churn.issues_in_project();
+    let open_in_project = churn.open_in_project();
+    check(cfg, open_in_project)?;
 
     let mut phases = Vec::new();
     phases.push(phase(
@@ -257,7 +262,8 @@ pub fn run(cfg: &Config) -> Result<Report, BenchError> {
     Ok(Report {
         seed_elapsed,
         db_bytes,
-        subscribed_issues,
+        issues_in_project,
+        open_in_project,
         hydrate_limit: pipeline.hydrate_limit,
         hydration,
         phases,

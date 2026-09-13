@@ -15,26 +15,31 @@ be bisected rather than argued about.
 
 ## Read this before reading the numbers
 
-**This measures the engine half.** As of [spike S3](#spike-s3--android-size-and-the-device-gate)
-it measures it on a physical Android phone as well as on the laptop, which
-closes two of the gaps this section used to list and leaves the ones a UI owns:
+**Most of this measures the engine half**, on a laptop and on a physical
+Android phone. [The Flutter demo](#the-flutter-demo--delta--committed-frame)
+measures the other half, on the same phone, and closes the gap this section used
+to describe as the demo apps' — for one of the two UI toolkits:
 
 | Plan §5.1 says | What is measured |
 |---|---|
-| p99 delta → **committed frame** | p99 delta → `pump` returned — the frame is still the demo apps' half |
+| p99 delta → **committed frame** | measured, Flutter — [the demo](#the-flutter-demo--delta--committed-frame). **FAIL at 23.4ms**, of which 24µs is this engine |
 | RSS on a **mid-range Android phone** | measured there — [spike S3](#spike-s3--android-size-and-the-device-gate) |
-| Decode of a 1000-row view in Dart and Kotlin | measured, on the laptop — [spike S1](#spike-s1--ffi-decode-cost) |
+| Decode of a 1000-row view in Dart | measured on the phone — [the demo](#the-first-frame-on-the-phone) |
+| Decode of a 1000-row view in Kotlin | measured, on the laptop, on HotSpot rather than ART — [spike S1](#spike-s1--ffi-decode-cost) |
 | APK size per ABI | the cdylib, built for the real ABIs — [spike S3](#spike-s3--android-size-and-the-device-gate) |
-| Jank on a Pixel 6a | — not yet, and it needs a UI |
+| Jank on a Pixel 6a | measured on a slower phone — 0.8% of frames over 16ms under continuous churn |
+| the same, from Compose | — not yet. That app is not written |
 
-So a number inside budget here is **necessary, not sufficient**. A number
-*outside* budget here would already be fatal, which is the entire reason for
-running this before building the FFI: if the engine cannot hold the budget on a
-desktop with nothing else in the way, the ABI on top of it is irrelevant.
+So an engine number inside budget is **necessary, not sufficient**. A number
+*outside* budget would already be fatal, which is the entire reason for running
+it before building the FFI: if the engine cannot hold the budget on a desktop
+with nothing else in the way, the ABI on top of it is irrelevant.
 
-Plan §9's go/no-go gate is a physical device, and the engine half of it now
-passes on one. The decision stays provisional until the demo apps close the gap
-between "the engine has the diff" and "the frame is on screen".
+Plan §9's go/no-go gate is a physical device. The engine passes on one; the
+Flutter app on top of it misses the end-to-end budget, and the decomposition
+puts 99.9% of the miss in Flutter's frame scheduling rather than in anything
+this project wrote. Read that section before reading the verdict as a
+vindication *or* as a kill.
 
 ## Environment
 
@@ -50,6 +55,8 @@ written for.
 | OS | Arch Linux, kernel 7.2.2 | Android 16 (API 36), arm64-v8a |
 | rustc | 1.95.0, `--release` | 1.95.0, `--release`, NDK r28, minSdk 24 |
 | SQLite | 3.53.4 (bundled via `rusqlite`) | same, cross-compiled |
+| Display | — | 1080×2400, **90Hz** — an 11.1ms refresh interval |
+| Flutter | — | 3.44.4 stable, `--release`, Impeller/Vulkan |
 | Date | 2026-09-12 | 2026-09-13 |
 
 The A72 is a 2020 mid-ranger and deliberately slower than the Pixel 6a plan §5.1
@@ -66,8 +73,13 @@ fail:
 
 over 100,000 issues and 1,000,000 comments across 50 projects (89.1 MB of
 SQLite, `journal_mode=WAL`, `mmap_size=64MB`). The subscribed project holds
-2,014 open issues, so the 50-row window has ~40× more candidates below it than
-it can show — the window has to actually work.
+2,014 issues, **1,376 of them open**, so the 50-row window has ~27× more
+candidates below it than it can show — the window has to actually work.
+
+(An earlier version of this line read "2,014 open issues" and put the ratio at
+40×. 2,014 is every issue in the project, which is the set the workload aims
+writes at; the window's candidates are the open ones. The harness now prints
+both numbers and checks the window against the right one.)
 
 The pipeline is the four operators M0 ships, in the order that keeps the memory
 bound: `Source → Filter → TopK → Join(1:N)`, with the window **below** the join
@@ -89,18 +101,22 @@ right one.
 
 | Metric | Budget | Laptop | **Galaxy A72** | |
 |---|---|---|---|---|
+| **p99 delta → committed frame** | < 16ms | — | **23.4ms**, [Flutter](#the-flutter-demo--delta--committed-frame) | **FAIL** |
+| ⤷ of which this engine | — | — | **24µs** | — |
 | p99 delta → `pump` returned | < 16ms | 190µs | **410–437µs** | PASS |
 | Engine operator state | < 60MB | 80.7 KB | **80.7 KB** | PASS |
 | Peak anonymous RSS | < 60MB | 6.3 MB | **6.5–6.6 MB** | PASS |
 | `TopK` refills/sec at 200 rows/sec | < 5 | 1.4 | **1.4** | PASS |
 | Decode of a 1000-row view — Kotlin | < 5ms | **1.65ms** | — | PASS |
 | Decode of a 1000-row view — Dart, `package:protobuf` | < 5ms | **6.14ms** | — | **FAIL** |
-| Decode of a 1000-row view — Dart, zero-copy accessor | < 5ms | **8.30µs** | — | PASS |
+| Decode of a 1000-row view — Dart, zero-copy accessor | < 5ms | **8.30µs** | **137µs** | PASS |
+| Jank under continuous churn | not visible | — | **0.8% of frames over 16ms** | PASS |
 | APK size per ABI | < 8MB | — | **1.73–1.84 MB** of cdylib, arm64-v8a | PASS |
 | Worst single pump | — | 409µs | **21.3–21.6ms** | see S3 |
 
-The decode rows are laptop-only because the hosts have not been cross-compiled
-yet; the phone columns are the engine, measured by
+The Dart decode now has a phone column because the host is on the phone; the
+Kotlin one does not, because that app is not written. The other phone columns
+are the engine, measured by
 [spike S3](#spike-s3--android-size-and-the-device-gate) on the device named
 above. The last row is not a criterion the plan states, and it is here because
 it is the only number in the table that behaves differently on a phone than on a
@@ -364,16 +380,158 @@ aligned to 4 KB does not load at all. NDK r28 aligns by default and r27 needs a
 linker flag, so `build.sh` verifies every 64-bit library it produces instead of
 trusting the toolchain version.
 
+## The Flutter demo — delta → committed frame
+
+Plan §5.1's one question that no harness can answer, measured where it ends: on
+the glass. The app is [`examples/flutter-issues/`](examples/flutter-issues/) —
+the same query, the same 89 MB fixture, a release build on the same phone, with
+its own background driver doing the plan's 200 rows/sec.
+
+**How the two ends are joined.** A delta stamps a wall clock the instant it
+lands on the isolate; the build that consumes it files that stamp under
+`PlatformDispatcher.frameData.frameNumber`; `FrameTiming` reports the same frame
+number after it has rasterized, carrying `rasterFinishWallTime` — the one frame
+phase on the system clock rather than a monotonic one whose epoch the docs
+decline to relate. No sampling and no "we assume it made the next frame": when
+several deltas coalesce into one frame, each gets its own honest, larger
+time-to-glass. The probe measures the skew between the two clocks on the first
+frame and refuses to report latencies at all if it is implausible.
+
+60 seconds of churn, 200 rows/sec, 5,520 deltas, 4,356 frames:
+
+| | measured | budget | |
+|---|---|---|---|
+| p50 delta → committed frame | 12.7ms | — | — |
+| **p99 delta → committed frame** | **23.4ms** | < 16ms | **FAIL** |
+| max delta → committed frame | 45.6ms | — | — |
+| frames over 16ms | 37 / 4,356 — 0.8% | — | — |
+| frames over the panel's 11.1ms | 255 / 4,356 — 5.9% | — | — |
+| worst frame (build / raster) | 39.3ms (18.9ms / 15.7ms) | — | — |
+
+**It fails, and the decomposition says the engine is 0.1% of it.** The same
+sample, cut into the three legs it is made of — each taken at its own p99, so
+they do not add up to the row above and are not meant to:
+
+| leg | p99 | whose |
+|---|---|---|
+| **apply** — FFI bytes → indexed rows | **24µs** | Solstice |
+| wait — applied → the build that picks it up | 12.5ms | Flutter's scheduler + vsync |
+| pipeline — that build → raster finished | 14.1ms | Flutter's renderer |
+
+24µs of 23.4ms. Whatever is wrong here, making the engine faster cannot fix it:
+the budget would still be missed if `apply` were free.
+
+The other two legs are the cost of putting *any* change on screen in Flutter,
+and on a 90Hz panel the arithmetic is unkind. 16ms is **1.44 refresh intervals**.
+A delta arrives at an arbitrary point in an 11.1ms interval, so it waits up to a
+full one before a build can start; the build then hands off to a rasterizer on
+another thread, which finishes in the next interval. Two intervals is 22.2ms
+before a single row has been laid out. The plan's 16ms was written as "one
+60Hz frame" and reads as a frame budget; measured end-to-end from an
+asynchronous arrival it is below the floor of the platform, not of this engine.
+
+That is an explanation, not an excuse, and the number stays a **FAIL** in the
+table because the criterion is the criterion. What the decomposition changes is
+which way to look next: at frame scheduling — coalescing deltas, `AnimatedList`
+handoff, whether a host should ever rebuild on a delta that is off-screen — and
+not at the byte ABI, which S1 already made 8µs and which this run confirms at
+24µs on a phone under load.
+
+**Two things the demo itself was doing wrong, both found by this measurement and
+both fixed before the numbers above were taken.** They are recorded because they
+are the failure mode of any instrumented app:
+
+- The HUD read `p50`, `p99` and `max` from the live probe, and each of those
+  sorts the whole sample. It rebuilt on every delta — ninety times a second, to
+  redraw numbers that change once a second. Frames over 16ms: **368 → 26**.
+- Every delta called `setState` on the whole page, rebuilding the HUD along with
+  the list. Scoping the rebuild to the list — which is what plan §4.4's
+  `SolsticeQueryBuilder` does — took frames over the panel period from **439 →
+  255**.
+
+An instrument that perturbs what it measures is not an instrument.
+
+### The first frame, on the phone
+
+| | k = 50 | k = 1000 |
+|---|---|---|
+| `Database.open` | 4.00ms | 4.20ms |
+| `subscribe` (hydrates the pipeline) | 7.28ms | 123.5ms |
+| `initial()` — bytes across FFI | 262µs (13.4 KB) | 5.09ms (267.9 KB) |
+| **index the rows (zero-copy accessor)** | **19µs** | **137µs** |
+| engine view state | 30.8 KB | 777.7 KB |
+| engine graph state | 95.9 KB | 2.5 MB |
+
+**The 1000-row decode criterion passes on device by 36×**: 137µs against 5ms.
+That is S1's fallback — generated zero-copy accessors — doing on an arm64 phone
+what it did at 8.30µs on the laptop, against the eager `package:protobuf` path
+that failed the same budget at 6.14ms. The 1000-row row is the one plan §5.1
+names; k = 50 is the shape the rest of this section measures.
+
+`subscribe` at k = 1000 costs 123.5ms because it hydrates 1000 parents and their
+10,000 children through the join. It is not a criterion and it is not on the
+delta path, but it is the number a host would feel on a cold navigation, and a
+1000-row list on a phone is a strange thing to ask for.
+
+### Correctness, which comes first
+
+A latency for the wrong list is worth nothing, so the app checks itself while it
+is being measured and the checks are reported next to the numbers:
+
+| | over 60s of churn |
+|---|---|
+| deltas received here / sent by the engine | 5,520 / 5,520 |
+| rows here / rows in the engine | 50 / 50 |
+| key mismatches · out-of-range indices | 0 · 0 |
+| deltas leaving the window unsorted | 0 |
+| changes applied | +1,297 −1,297 ~7,752 ↕479 |
+| `TopK` window refills | 23 — **0.37/sec**, budget < 5 |
+| join child refills | 1,347 |
+| writes refused by the engine | 0 |
+
+The first two rows are computed on opposite sides of the FFI boundary from the
+same stream of changes; they disagreeing would be a correctness failure no
+latency number makes up for. The sort check walks all 50 rows after every
+delta — a thing no real app would do — and a control build with it off measured
+**p99 25.5ms**, i.e. slightly *worse*, on a byte-identical workload. The driver
+is seeded, so both runs issued the same 12,421 operations in the same 6,189
+transactions and reached the same engine version; the 2ms between them is the
+phone, not the check. It is below this measurement's noise floor.
+
+**This is the run that found the bug worth the whole exercise.** An earlier
+build reported 62 key mismatches and a visibly unsorted list, and the engine and
+the applier had each already been proved correct on their own. What separated
+them was counting deltas on both sides of the boundary: 1,123 received against
+1,123 sent said nothing was lost in transit, which left only "misapplied", which
+led to `adb logcat` and a `Bad state: wire type 6` thrown from the middle of
+`apply`. The cause was one line of Dart in the hand-written accessor —
+
+```dart
+p += varint();   // wrong: Dart reads `p` before calling `varint()`,
+                 // so the length prefix the call consumed is un-consumed
+```
+
+— which made every skip of a length-delimited field land inside the payload.
+The only such field in a delta is `Changed.cols`, and `cols` is `[6]` whenever a
+comment is added or dropped, so the next byte read as a tag was `0x06`, an
+invalid wire type, and the exception aborted the delta half-applied.
+`test/view_test.dart` now feeds the applier a `cols` list that reproduces it and
+an unknown field placed *ahead* of the ones it reads, which is plan §3.5's
+forward-compatibility promise and the reason `skip` exists at all.
+
 ## What this does not yet prove
 
-- The engine has run on a phone; the *hosts* have not. Dart and Kotlin are still
-  measured on a laptop, and Kotlin on HotSpot rather than ART — the JNA upcall
-  S2 makes so much of is one of the things most likely to differ there.
-- Nothing stops at the frame. `mutate → delta at the host` is not `delta →
-  committed frame`; nothing here has laid out a list. The WAL finding is a
-  reason to measure that rather than to extrapolate it.
-- The APK is a cdylib, not an APK. Nothing yet checks what Gradle and AGP add
-  around it.
+- **Half the premise is untested.** Plan §5.1 asks the question from *two*
+  sides, and only Flutter has answered. Kotlin is still measured on a laptop on
+  HotSpot rather than ART — the JNA upcall S2 makes so much of is one of the
+  things most likely to differ there — and no Compose app has laid out a list.
+  Nothing here licenses assuming the Flutter result transfers.
+- The frame numbers are one device, one panel, one refresh rate. 90Hz is what
+  made 16ms a sub-frame budget; a 60Hz phone would read differently, and neither
+  reading would be more honest than the other without saying which it was.
+- The APK is a cdylib in the size table and a real 50.4 MB Flutter release APK
+  in the demo — which is Flutter's engine and debug symbols, not this library.
+  Nothing yet measures what Solstice adds to an app that already exists.
 - Two phases of synthetic traffic are not eight months of a real app. The
   self-check makes the view *correct*; it does not make the workload
   *representative*.

@@ -29,6 +29,16 @@
 /spikes/s2-bridge/kotlin/gen/
 /spikes/s2-bridge/kotlin/lib/
 
+# Demo apps — same rule as the spikes, for the same reason. Everything below is
+# written by `examples/flutter-issues/generate.sh` (protoc, the bridge, freezed,
+# `cargo ndk`) or by `cargo run -p solstice-bench --bin demo-fixture`, and every
+# one of them reads inputs that are themselves committed. The fixture is also
+# 85 MB of seeded SQLite, which is not a thing to put in a git history.
+/examples/fixtures/
+/examples/flutter-issues/lib/gen/
+/examples/flutter-issues/lib/src/rust/
+/examples/flutter-issues/android/app/src/main/jniLibs/
+
 # Dart / Flutter
 .dart_tool/
 .packages

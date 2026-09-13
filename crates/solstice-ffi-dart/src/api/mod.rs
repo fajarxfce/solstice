@@ -163,8 +163,30 @@ impl Database {
 
     /// Apply an encoded `solstice.v1.Mutation`, returning the version it landed
     /// at. Every `ViewDelta` this write causes carries that version.
+    ///
+    /// `sync`, because this is the write a user's tap makes and plan §2.4 wants
+    /// `h.applied` true before the call returns. The engine is a command loop on
+    /// another thread, so "sync" here means the Dart isolate waits for it.
     #[frb(sync)]
     pub fn mutate(&self, body: Vec<u8>) -> Result<u64, SolsticeError> {
+        Ok(self.0.mutate(body)?)
+    }
+
+    /// The same write, dispatched off the Dart isolate.
+    ///
+    /// Not a convenience, and the one place the two adapters do not line up.
+    /// Writes that a *user* did not make — a sync engine applying a server
+    /// patch, plan §5.1's background thread at 200 rows/sec — must not stop the
+    /// isolate that paints frames, and Dart has exactly one of those per app.
+    /// Without a `Future`, a write that hits SQLite's WAL checkpoint would take
+    /// 21ms of the UI thread (spike S3) and drop a frame and a half for reasons
+    /// having nothing to do with the view.
+    ///
+    /// Kotlin needs no twin of this: a Compose app already has threads, so the
+    /// idiomatic answer there is to call the blocking method from
+    /// `Dispatchers.IO`. Dart cannot do that for an FFI call, so the hand-off
+    /// has to live on this side of the boundary.
+    pub fn mutate_async(&self, body: Vec<u8>) -> Result<u64, SolsticeError> {
         Ok(self.0.mutate(body)?)
     }
 

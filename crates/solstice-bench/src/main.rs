@@ -185,13 +185,14 @@ fn print(args: &Args, r: &Report) {
         q.k, q.project, q.comments
     );
     println!(
-        "store: {} · {} subscribed issues in the project",
+        "store: {} · {} issues in the project, {} of them open",
         match (&cfg.db, r.db_bytes) {
             (Some(p), Some(n)) => format!("{} ({})", p.display(), bytes(n)),
             (Some(p), None) => p.display().to_string(),
             (None, _) => "in memory".to_string(),
         },
-        r.subscribed_issues
+        r.issues_in_project,
+        r.open_in_project
     );
     println!();
 
