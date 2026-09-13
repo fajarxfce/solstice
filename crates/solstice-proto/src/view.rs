@@ -99,7 +99,7 @@ fn put_change(e: &mut Encoder, change: &ViewChange) {
     }
 }
 
-fn put_row(e: &mut Encoder, field: u32, row: &Row) {
+pub(crate) fn put_row(e: &mut Encoder, field: u32, row: &Row) {
     e.message(field, |e| {
         for v in row.values() {
             put_value(e, 1, v);
@@ -107,7 +107,7 @@ fn put_row(e: &mut Encoder, field: u32, row: &Row) {
     });
 }
 
-fn put_value(e: &mut Encoder, field: u32, v: &Value) {
+pub(crate) fn put_value(e: &mut Encoder, field: u32, v: &Value) {
     e.message(field, |e| match v {
         // NULL is the empty message: the oneof simply has no case set. Every
         // other arm writes its field even when the payload is zero, because in
@@ -232,7 +232,7 @@ fn read_indexed_row(d: &mut Decoder<'_>) -> Result<(u32, Row), WireError> {
     Ok((index, row))
 }
 
-fn read_row(d: &mut Decoder<'_>) -> Result<Row, WireError> {
+pub(crate) fn read_row(d: &mut Decoder<'_>) -> Result<Row, WireError> {
     let mut values = Vec::new();
     while !d.is_done() {
         let t = d.tag()?;
@@ -244,7 +244,7 @@ fn read_row(d: &mut Decoder<'_>) -> Result<Row, WireError> {
     Ok(Row::new(values))
 }
 
-fn read_value(d: &mut Decoder<'_>) -> Result<Value, WireError> {
+pub(crate) fn read_value(d: &mut Decoder<'_>) -> Result<Value, WireError> {
     let mut v = Value::Null;
     while !d.is_done() {
         let t = d.tag()?;

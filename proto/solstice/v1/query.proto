@@ -1,0 +1,174 @@
+// The query IR: what a host sends to subscribe.
+//
+// Plan §1.2 asks for *one* artefact serving the FFI transport, the wire
+// protocol, the cache key and the shape identity on the server. `view.proto` is
+// the payload half; this is the request half, and it is the direction spike S1
+// never measured — S1 timed bytes coming *out* of Rust.
+//
+// # Names, not ids
+//
+// Columns and tables are named here, where `solstice-ivm` addresses them by
+// `TableId` and `ColId`. That asymmetry is the point of having two types:
+//
+//   * On the wire a name is stable across schema versions and across machines.
+//     An id is an artefact of one process's load order, and a client and server
+//     that disagreed about it would diverge silently — the exact failure plan
+//     §3.2 spends the shared-IVM decision to make impossible.
+//   * Inside the engine a name is a string compare on the hot path.
+//
+// So the resolution from one to the other happens exactly once, at subscribe,
+// against the schema — and an unknown name is an error a developer sees at the
+// call that caused it. `solstice-core`'s `compile` module is that step.
+//
+// Rows, by contrast, are positional (see `Row` in view.proto): a name on the
+// wire costs nothing once per subscribe and 21,000 times per view.
+//
+// # Parameters are in the message, and that is what makes sharing work
+//
+// Plan §1.2 derives two identities from this message:
+//
+//     PipelineId = hash(IR without params)      ViewId = hash(IR with params)
+//
+// N users running the same query with different `$userId` share one dataflow
+// pipeline, partitioned by parameter. That is the whole economic argument for
+// the hosted service, and it only holds if the parameters are a *separable
+// field* of the IR rather than folded into the predicate as literals. Hence
+// `Expr.param` alongside `Expr.lit`: a literal is part of the query's identity,
+// a parameter is part of the view's.
+//
+// # Stability
+//
+// None yet. Protocol version 0.x (plan §3.5).
+
+syntax = "proto3";
+
+package solstice.v1;
+
+import "solstice/v1/view.proto";
+
+option java_package = "dev.solstice.proto.v1";
+option java_multiple_files = true;
+option java_outer_classname = "QueryProto";
+
+// A subscription request.
+//
+// Every field here is something plan §1.1 admits into v1 and `solstice-ivm`
+// already implements. The parts of plan §1.2's `Query` that M0 does not yet
+// have an operator for — `start_after`, `aggs`, `select` — are not declared as
+// TODOs, they are simply absent, and their field numbers are reserved so that
+// adding them later is additive rather than a renumbering.
+message Query {
+  string table = 1;
+  Predicate where = 2;
+  repeated Order order_by = 3;
+  // Mandatory on list roots and on 1:N traversal (plan §1.1). Zero means
+  // unbounded, which the engine rejects unless `allow_unbounded` is set: a
+  // query with no window is the memory blow-up plan §7 is about, and it should
+  // be impossible to write one by forgetting something.
+  uint32 limit = 4;
+  repeated Related related = 6;
+  bool allow_unbounded = 9;
+  // Positional, matching `Expr.param`.
+  repeated Value params = 10;
+
+  reserved 5, 7, 8;  // start_after, aggs, select
+}
+
+// A declared relation traversed from the parent.
+//
+// `rel_name` rather than a join condition, because plan §1.1 admits traversal
+// only over relations the schema declares. That restriction is what bounds the
+// operator: the engine knows the parent and child columns, knows they are
+// indexed, and can therefore answer a per-parent child window with a seek. A
+// free-form join predicate could not promise any of that.
+message Related {
+  string rel_name = 1;
+  Query sub = 2;
+  // The column the children are attached to on the parent row. Empty means the
+  // relation's own name.
+  string as = 3;
+}
+
+message Order {
+  string col = 1;
+  bool desc = 2;
+}
+
+// A scalar expression. Deliberately not recursive: plan §1.1 excludes computed
+// expressions from predicates and `orderBy` alike, because a computed sort key
+// cannot be indexed, and an unindexed sort is an unbounded scan wearing a
+// disguise. Computed values belong in generated columns.
+message Expr {
+  oneof kind {
+    string col = 1;
+    Value lit = 2;
+    uint32 param = 3;
+  }
+}
+
+enum CmpOp {
+  CMP_OP_UNSPECIFIED = 0;
+  CMP_OP_EQ = 1;
+  CMP_OP_NE = 2;
+  CMP_OP_LT = 3;
+  CMP_OP_LE = 4;
+  CMP_OP_GT = 5;
+  CMP_OP_GE = 6;
+}
+
+// The v1 predicate set, and nothing else.
+//
+// The rule that drew this line (plan §1.1): every form here can be decided from
+// a row plus its bound parameters, with no scan and no operator state. That is
+// what lets `Filter` be stateless and what lets the dispatcher index predicates
+// by equality column instead of broadcasting every write to every pipeline.
+message Predicate {
+  oneof kind {
+    // Matches everything — the identity of `and`, and what an absent `where`
+    // compiles to. A message rather than a `bool` so that an explicitly-true
+    // predicate and an unset `where` encode identically.
+    True yes = 1;
+    Cmp cmp = 2;
+    In in_list = 3;
+    Between between = 4;
+    Expr is_null = 5;
+    Expr is_not_null = 6;
+    LikePrefix like_prefix = 7;
+    PredicateList and = 8;
+    PredicateList or = 9;
+    Predicate not = 10;
+  }
+}
+
+message True {}
+
+message PredicateList {
+  repeated Predicate preds = 1;
+}
+
+message Cmp {
+  Expr lhs = 1;
+  CmpOp op = 2;
+  Expr rhs = 3;
+}
+
+message In {
+  Expr lhs = 1;
+  repeated Value list = 2;
+}
+
+message Between {
+  Expr lhs = 1;
+  Expr low = 2;
+  Expr high = 3;
+}
+
+// `LIKE 'prefix%'` and no other form. An anchored prefix is the one `LIKE` an
+// index answers in O(log n); infix and suffix matching are full-text search,
+// which plan §1.1 keeps out of the IVM graph entirely. The prefix is carried
+// without its trailing `%` so that no implementation has to parse SQL's
+// escaping rules to find out what was meant.
+message LikePrefix {
+  Expr lhs = 1;
+  string prefix = 2;
+}

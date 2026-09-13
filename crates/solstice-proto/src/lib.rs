@@ -25,15 +25,26 @@
 //!
 //! - [`wire`] — varints, tags, length-delimited framing. No schema knowledge.
 //! - [`view`] — [`ViewDelta`] and [`ViewChange`], transcribed from
-//!   `proto/solstice/v1/view.proto`.
+//!   `proto/solstice/v1/view.proto`. The payload half: what comes *out*.
+//! - [`query`] — [`Query`], transcribed from `proto/solstice/v1/query.proto`.
+//!   The request half: what goes *in*, and the direction spike S1 never timed.
+//! - [`mutation`] — [`Mutation`], transcribed from
+//!   `proto/solstice/v1/mutation.proto`. The write half.
+//!
+//! Which is all four of the things plan §4.1 sends across FFI as bytes, bar the
+//! engine events — and those are view diffs in an envelope.
 //!
 //! The payloads the host benchmarks decode are produced by the `s1-fixture`
 //! binary in `solstice-bench`, from a real hydration against real SQLite —
 //! measuring a decode of rows this crate invented would only prove that the
 //! invented rows were easy to decode.
 
+pub mod mutation;
+pub mod query;
 pub mod view;
 pub mod wire;
 
+pub use mutation::Mutation;
+pub use query::Query;
 pub use view::{ViewChange, ViewDelta};
 pub use wire::WireError;

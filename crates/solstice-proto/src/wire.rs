@@ -191,6 +191,14 @@ pub enum WireError {
     TypeMismatch { field: u32, wire: u32 },
     /// Text that is not UTF-8.
     BadUtf8,
+    /// An enum value this version does not know, in a position where there is
+    /// no safe default.
+    ///
+    /// Unknown *fields* are skipped (plan §3.5's forward-compatibility promise).
+    /// An unknown comparison operator is different in kind: every choice the
+    /// decoder could make returns some set of rows, so guessing produces a
+    /// silently wrong view rather than a failure anyone can see.
+    UnknownEnum { field: u32, value: u64 },
     /// Nesting past the depth the schema can produce. DQL caps relation
     /// traversal at depth 3 (plan §1.1); anything deeper is either a bug or a
     /// frame built to blow the stack.
@@ -211,6 +219,9 @@ impl std::fmt::Display for WireError {
                 write!(f, "field {field} has wire type {wire}, which it never uses")
             }
             WireError::BadUtf8 => write!(f, "text field is not valid UTF-8"),
+            WireError::UnknownEnum { field, value } => {
+                write!(f, "field {field} holds unknown enum value {value}")
+            }
             WireError::TooDeep => write!(f, "nested past the maximum depth"),
         }
     }

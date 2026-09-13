@@ -1,0 +1,98 @@
+// Mutation bodies: the third of the four things plan §4.1 sends across FFI as
+// bytes, and the only one that also has to survive a round trip through a
+// backend written by somebody else.
+//
+// # Why `Patch` is declarative
+//
+// Plan §2.1 splits mutations in two. `Patch` is a list of typed operations any
+// backend can apply generically from a permission policy — **zero backend code
+// for a CRUD app**, which is the adoption path. `Call` is a named mutation the
+// server implements in whatever language it likes, with a speculative local
+// implementation on the client that is allowed to be wrong because the rebase
+// fixes it.
+//
+// M0 has no server, so only `Patch` is declared here. `Call` has its field
+// number reserved rather than a comment promising it.
+//
+// # Why `set` is a repeated pair and not a map
+//
+// A protobuf `map` is repeated key/value entries with no defined order, and
+// plan §1.2 hashes these messages for identity and idempotency. Two encoders
+// that disagree about map ordering would produce two hashes for one mutation —
+// and the `(client_id, mutation_id)` exactly-once guarantee in plan §3.4 is
+// exactly the thing that must not depend on an encoder's iteration order.
+//
+// # Stability
+//
+// None yet. Protocol version 0.x (plan §3.5).
+
+syntax = "proto3";
+
+package solstice.v1;
+
+import "solstice/v1/view.proto";
+
+option java_package = "dev.solstice.proto.v1";
+option java_multiple_files = true;
+option java_outer_classname = "MutationProto";
+
+message Mutation {
+  bytes client_id = 2;
+  // Monotonic per client. It is the idempotency key, and plan §3.4 requires the
+  // server to advance `last_mutation_id` in the *same database transaction* as
+  // the effects — the single requirement most often got wrong, and getting it
+  // wrong means double charges and lost writes.
+  uint64 mutation_id = 3;
+  // Advisory only, never trusted for ordering. A client's clock is a fact about
+  // that client.
+  int64 timestamp_ms = 4;
+
+  oneof body {
+    Patch patch = 5;
+  }
+
+  reserved 1;  // client_group_id, when there are groups
+  reserved 6;  // call
+}
+
+message Patch {
+  repeated Op ops = 1;
+}
+
+message Op {
+  oneof op {
+    Insert insert = 1;
+    Update update = 2;
+    Delete delete = 3;
+  }
+
+  reserved 4, 5;  // upsert, increment
+}
+
+message Insert {
+  string table = 1;
+  // Positional, like every other row on the wire: column *i* is the column the
+  // schema declares at index *i*.
+  Row row = 2;
+}
+
+message Update {
+  string table = 1;
+  Value key = 2;
+  repeated ColValue set = 3;
+
+  reserved 4;  // expect — the precondition, once there is a server to fail it
+}
+
+message Delete {
+  string table = 1;
+  Value key = 2;
+}
+
+// Named rather than positional, because an update names the columns it touches
+// and a sparse positional row would need a separate presence mask to say which
+// of them it meant.
+message ColValue {
+  string col = 1;
+  Value value = 2;
+}
