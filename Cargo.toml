@@ -2,6 +2,7 @@
 resolver = "2"
 members = [
     "crates/solstice-bench",
+    "crates/solstice-core",
     "crates/solstice-ivm",
     "crates/solstice-proto",
     "crates/solstice-store",

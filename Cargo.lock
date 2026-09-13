@@ -397,6 +397,16 @@ checksum = "ba467056f1b547ed52077911161fc86985becbc60e8e1857c8a144dab0def891"
 name = "solstice-bench"
 version = "0.0.1"
 dependencies = [
+ "solstice-core",
+ "solstice-ivm",
+ "solstice-proto",
+ "solstice-store",
+]
+
+[[package]]
+name = "solstice-core"
+version = "0.0.1"
+dependencies = [
  "solstice-ivm",
  "solstice-proto",
  "solstice-store",

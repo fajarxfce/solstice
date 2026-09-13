@@ -1,90 +1,34 @@
-//! The hardcoded M0 world: issues, comments, and the one query that matters.
+//! Data for the M0 world, and the pipeline the harness measures.
 //!
-//! Plan §5.1 fakes everything in the spike except the risk, so there is no
-//! schema DSL and no codegen here — two tables written out by hand, and the
-//! query from plan §7 that names the project's most likely way to fail:
+//! The world itself — the two tables, the column ids, the query from plan §7 —
+//! lives in [`solstice_core::m0`] and is re-exported here. It used to be
+//! written out twice, and two hand-written copies of a schema agree right up
+//! until the morning someone adds a column. What is left in this module is what
+//! only a benchmark needs: how much data to generate, what it looks like, and
+//! which indexes the store gets.
 //!
-//! > the top 50 issues by priority in my project, each with its 3 latest
-//! > comments
+//! # The pipeline is the engine's, not the harness's
 //!
-//! Every operator in that sentence is one of the four M0 ships, arranged in the
-//! order that makes the memory bound hold: `Source → Filter → TopK → Join(1:N)`,
-//! with the window *below* the join so the join only ever holds children for
-//! parents that are on screen (see [`solstice_ivm::ops::join`]).
+//! [`build`] compiles plan §7's query through [`solstice_core::compile`], the
+//! same function [`Database::subscribe`](solstice_core::Database::subscribe)
+//! calls. That matters more than the deduplication: a benchmark that wired its
+//! own graph would be measuring a pipeline no user can subscribe to, and it
+//! would keep reporting green after the compiler started building a different
+//! one.
 //!
-//! # Hydration is bounded, and that is a planner decision
-//!
-//! A `Source` with no limit reads the whole table. Feeding 100k issues through
-//! it to keep 50 is not just slow, it is the memory blow-up plan §7 warns about
-//! arriving during the first frame. Because the source can scan in the window's
-//! own order, it only has to read `k + slack + 1` rows — and the `+ 1` is load
-//! bearing for the same reason it is in `Join1N::build_state`: a `TopK` learns
-//! that rows exist below its window only by discarding one, so a scan of
-//! exactly `k + slack` would leave it believing it holds the whole relation and
-//! it would never refill.
+//! What the harness still needs, and the engine does not expose, is the
+//! *pieces* — the filter and params to run a scan under, the sort order to
+//! check a window against, the hydration bound to assert against. Those come
+//! out of [`solstice_core::Compiled`] and are repackaged as [`Pipeline`].
 
 use crate::rng::Rng;
-use solstice_ivm::ops::{Filter, Join1N, Source, TopK};
-use solstice_ivm::{
-    Batch, Change, ColId, Column, Dir, Expr, Graph, GraphBuilder, Params, Predicate, Row, RowKey,
-    Schema, TableId, Value, ValueType,
-};
+use solstice_core::{compile, m0};
+use solstice_ivm::{Batch, Change, ColId, Dir, Graph, Params, Predicate, Row, RowKey, Value};
 use solstice_store::{SqliteStore, StoreError};
 
-pub const ISSUES: TableId = 1;
-pub const COMMENTS: TableId = 2;
-
-/// Column ids for `issues`. Named because `row.get(2)` at a call site is a bug
-/// waiting for the day someone adds a column in the middle.
-pub mod issue {
-    use solstice_ivm::ColId;
-    pub const ID: ColId = 0;
-    pub const PROJECT: ColId = 1;
-    pub const PRIORITY: ColId = 2;
-    pub const CLOSED: ColId = 3;
-    pub const TITLE: ColId = 4;
-    pub const UPDATED_AT: ColId = 5;
-}
-
-/// Column ids for `comments`.
-pub mod comment {
-    use solstice_ivm::ColId;
-    pub const ID: ColId = 0;
-    pub const ISSUE: ColId = 1;
-    pub const CREATED_AT: ColId = 2;
-    pub const AUTHOR: ColId = 3;
-    pub const BODY: ColId = 4;
-}
-
-pub fn schemas() -> Vec<Schema> {
-    vec![
-        Schema::new(
-            ISSUES,
-            "issues",
-            vec![
-                Column::new("id", ValueType::Int),
-                Column::new("project_id", ValueType::Int),
-                Column::new("priority", ValueType::Int).nullable(),
-                Column::new("closed", ValueType::Int),
-                Column::new("title", ValueType::Text),
-                Column::new("updated_at", ValueType::Int),
-            ],
-            issue::ID,
-        ),
-        Schema::new(
-            COMMENTS,
-            "comments",
-            vec![
-                Column::new("id", ValueType::Int),
-                Column::new("issue_id", ValueType::Int),
-                Column::new("created_at", ValueType::Int),
-                Column::new("author", ValueType::Text),
-                Column::new("body", ValueType::Text),
-            ],
-            comment::ID,
-        ),
-    ]
-}
+pub use solstice_core::m0::{
+    comment, comment_order, issue, issue_filter, issue_order, schemas, COMMENTS, ISSUES,
+};
 
 /// How much data to generate.
 #[derive(Debug, Clone, Copy)]
@@ -139,31 +83,6 @@ impl Default for Query {
     }
 }
 
-/// `project_id = $0 AND closed = 0`.
-///
-/// The project is a *parameter* rather than a literal because plan §1.2 shares
-/// one pipeline across every user running the same query with different
-/// bindings. Writing it as a literal here would measure a query shape the real
-/// engine never runs.
-pub fn issue_filter() -> Predicate {
-    Predicate::and([
-        Predicate::Cmp {
-            lhs: Expr::Col(issue::PROJECT),
-            op: solstice_ivm::CmpOp::Eq,
-            rhs: Expr::Param(0),
-        },
-        Predicate::eq(issue::CLOSED, 0i64),
-    ])
-}
-
-pub fn issue_order() -> Vec<(ColId, Dir)> {
-    vec![(issue::PRIORITY, Dir::Desc)]
-}
-
-pub fn comment_order() -> Vec<(ColId, Dir)> {
-    vec![(comment::CREATED_AT, Dir::Desc)]
-}
-
 /// A wired graph plus the pieces of it a harness has to ask questions about.
 pub struct Pipeline {
     pub graph: Graph,
@@ -176,51 +95,21 @@ pub struct Pipeline {
     pub hydrate_limit: usize,
 }
 
+/// Compile plan §7's query the way a subscription does.
+///
+/// Panics rather than returning an error: every `Query` this harness can build
+/// is one the compiler accepts, and a benchmark that reported a compile failure
+/// as a slow result would be worse than one that stopped.
 pub fn build(q: &Query) -> Pipeline {
-    let filter = issue_filter();
-    let params = Params::new(vec![Value::Int(q.project)]);
-    let order = issue_order();
-    let child_order = comment_order();
-
-    let topk = TopK::new(ISSUES, order.clone(), q.k).with_pushdown(filter.clone(), params.clone());
-    let hydrate_limit = q.k + topk.slack() + 1;
-
-    let source = Source::new(ISSUES, issue::ID)
-        .with_pushdown(filter.clone(), params.clone())
-        .with_order(order.clone())
-        .with_limit(hydrate_limit);
-
-    let mut b = GraphBuilder::new();
-    let n_issues = b.source(ISSUES, Box::new(source));
-    let n_filter = b.add(
-        Box::new(Filter::new(filter.clone(), params.clone())),
-        vec![n_issues],
-    );
-    let n_topk = b.add(Box::new(topk), vec![n_filter]);
-    // Deltas only: hydrating a million comments so the join can keep three per
-    // issue is the mistake this operator exists to avoid.
-    let n_comments = b.source(
-        COMMENTS,
-        Box::new(Source::new(COMMENTS, comment::ID).deltas_only()),
-    );
-    let n_join = b.add(
-        Box::new(Join1N::new(
-            COMMENTS,
-            issue::ID,
-            comment::ISSUE,
-            child_order.clone(),
-            q.comments,
-        )),
-        vec![n_topk, n_comments],
-    );
-
+    let ir = m0::query(q.project, q.k as u32, q.comments as u32);
+    let c = compile(&m0::catalog(), &ir).expect("the M0 query is what `compile` is written for");
     Pipeline {
-        graph: b.build(n_join),
-        filter,
-        params,
-        order,
-        child_order,
-        hydrate_limit,
+        child_order: c.children[0].order.clone(),
+        hydrate_limit: c.hydrate_limit.expect("a window query has a limit"),
+        graph: c.graph,
+        filter: c.filter,
+        params: c.params,
+        order: c.order,
     }
 }
 
@@ -264,22 +153,9 @@ pub fn create_indexes(store: &mut SqliteStore, mode: IndexMode) -> Result<(), St
             store.index_order(ISSUES, &issue_order())?;
             store.index_order(COMMENTS, &comment_order())?;
         }
-        IndexMode::Seek => {
-            // The source and the window both scan
-            // `WHERE project_id = ? AND closed = 0 ORDER BY priority DESC`.
-            store.index_seek(
-                ISSUES,
-                &[issue::PROJECT, issue::CLOSED],
-                &[(issue::PRIORITY, Dir::Desc)],
-            )?;
-            // Every per-parent child window scans
-            // `WHERE issue_id = ? ORDER BY created_at DESC`.
-            store.index_seek(
-                COMMENTS,
-                &[comment::ISSUE],
-                &[(comment::CREATED_AT, Dir::Desc)],
-            )?;
-        }
+        // The indexes a real `Database::open` creates, so the measured plan is
+        // the shipped one.
+        IndexMode::Seek => m0::index(store)?,
     }
     Ok(())
 }

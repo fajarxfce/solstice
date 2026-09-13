@@ -1,0 +1,15 @@
+[package]
+name = "solstice-core"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "The Solstice engine behind the byte ABI: compile a query IR, run the dataflow graph, emit positional diffs."
+
+[dependencies]
+solstice-ivm = { path = "../solstice-ivm" }
+solstice-proto = { path = "../solstice-proto" }
+solstice-store = { path = "../solstice-store" }
+
+[lints.rust]
+unsafe_code = "forbid"

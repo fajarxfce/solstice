@@ -8,6 +8,7 @@ description = "The M0 latency and memory harness: the kill criteria, measured."
 publish = false
 
 [dependencies]
+solstice-core = { path = "../solstice-core" }
 solstice-ivm = { path = "../solstice-ivm" }
 solstice-store = { path = "../solstice-store" }
 solstice-proto = { path = "../solstice-proto" }
