@@ -6,6 +6,10 @@ rust-version.workspace = true
 license.workspace = true
 description = "The M0 latency and memory harness: the kill criteria, measured."
 publish = false
+# Without this, `cargo run -p solstice-bench` stopped working the moment the
+# second spike fixture was added, and the command is written in this crate's
+# docs, in the root README, and in BENCHMARKS.md.
+default-run = "solstice-bench"
 
 [dependencies]
 solstice-core = { path = "../solstice-core" }

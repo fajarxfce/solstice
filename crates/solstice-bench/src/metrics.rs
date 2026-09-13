@@ -110,26 +110,54 @@ impl Rss {
 
 /// This process's resident memory, if the platform will say.
 ///
-/// Linux only, by reading `/proc/self/statm`. Returning `None` elsewhere rather
-/// than guessing: a number produced by a fallback nobody validated would be
-/// worse than no number, because it would be believed.
-#[cfg(target_os = "linux")]
+/// Linux and Android, by reading `/proc/self/smaps_rollup`. Returning `None`
+/// elsewhere rather than guessing: a number produced by a fallback nobody
+/// validated would be worse than no number, because it would be believed.
+///
+/// # Why not `statm`
+///
+/// `statm` reports page *counts*, so reading it means knowing the page size, and
+/// this crate has no libc dependency to ask `sysconf`. Hardcoding 4096 was true
+/// of every target this harness ran on right up until it ran on the one the
+/// criterion is about: Android 15 ships devices with 16 KB pages, and NDK r28
+/// aligns for them by default. That is not a rounding error, it is a factor of
+/// four, and it is wrong in the direction that makes the budget look met.
+///
+/// `smaps_rollup` reports kB, so the question does not arise. It also reports
+/// `Anonymous` directly instead of leaving it to be inferred as resident minus
+/// shared — `statm`'s "shared" is resident file-backed *plus* shared memory,
+/// which is the right neighbourhood and not the right number.
+#[cfg(any(target_os = "linux", target_os = "android"))]
 pub fn rss() -> Option<Rss> {
-    // Fields are page counts: size, resident, shared, ... The page size is 4096
-    // on every Linux target this project builds for, and `sysconf` would mean a
-    // libc dependency in a crate that has none.
-    const PAGE: u64 = 4096;
-    let statm = std::fs::read_to_string("/proc/self/statm").ok()?;
-    let mut fields = statm.split_whitespace().skip(1);
-    let resident: u64 = fields.next()?.parse().ok()?;
-    let shared: u64 = fields.next()?.parse().ok()?;
+    let rollup = std::fs::read_to_string("/proc/self/smaps_rollup").ok()?;
+    let (mut resident, mut anonymous) = (None, None);
+    for line in rollup.lines() {
+        // The first line is the address range header, which has colons in it but
+        // no `<number> kB` after them. Both parses have to fail softly.
+        let Some((key, rest)) = line.split_once(':') else {
+            continue;
+        };
+        let Some(kb) = rest
+            .split_whitespace()
+            .next()
+            .and_then(|n| n.parse::<u64>().ok())
+        else {
+            continue;
+        };
+        match key {
+            "Rss" => resident = Some(kb << 10),
+            "Anonymous" => anonymous = Some(kb << 10),
+            _ => {}
+        }
+    }
+    let resident = resident?;
     Some(Rss {
-        resident: resident * PAGE,
-        file_backed: shared * PAGE,
+        resident,
+        file_backed: resident.saturating_sub(anonymous?),
     })
 }
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(not(any(target_os = "linux", target_os = "android")))]
 pub fn rss() -> Option<Rss> {
     None
 }

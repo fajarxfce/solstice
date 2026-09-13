@@ -15,36 +15,46 @@ be bisected rather than argued about.
 
 ## Read this before reading the numbers
 
-**This measures the engine half, on a laptop.** Two of the six M0 kill criteria
-are not in here at all, and the two that are have a narrower meaning than the
-plan's wording:
+**This measures the engine half.** As of [spike S3](#spike-s3--android-size-and-the-device-gate)
+it measures it on a physical Android phone as well as on the laptop, which
+closes two of the gaps this section used to list and leaves the ones a UI owns:
 
-| Plan §5.1 says | This harness measures |
+| Plan §5.1 says | What is measured |
 |---|---|
-| p99 delta → **committed frame** | p99 delta → `pump` returned |
-| RSS on a **mid-range Android phone** | RSS on the machine named below |
-| Decode of a 1000-row view in Dart and Kotlin | measured, on the same laptop — [spike S1](#spike-s1--ffi-decode-cost) |
-| APK size per ABI | the cdylib's size, built for x86-64 — [spike S2](#spike-s2--the-boundary-itself) |
-| Jank on a Pixel 6a | — not yet |
+| p99 delta → **committed frame** | p99 delta → `pump` returned — the frame is still the demo apps' half |
+| RSS on a **mid-range Android phone** | measured there — [spike S3](#spike-s3--android-size-and-the-device-gate) |
+| Decode of a 1000-row view in Dart and Kotlin | measured, on the laptop — [spike S1](#spike-s1--ffi-decode-cost) |
+| APK size per ABI | the cdylib, built for the real ABIs — [spike S3](#spike-s3--android-size-and-the-device-gate) |
+| Jank on a Pixel 6a | — not yet, and it needs a UI |
 
 So a number inside budget here is **necessary, not sufficient**. A number
 *outside* budget here would already be fatal, which is the entire reason for
 running this before building the FFI: if the engine cannot hold the budget on a
 desktop with nothing else in the way, the ABI on top of it is irrelevant.
 
-The physical-device gate stands (plan §9), and until it runs, the go decision is
-provisional.
+Plan §9's go/no-go gate is a physical device, and the engine half of it now
+passes on one. The decision stays provisional until the demo apps close the gap
+between "the engine has the diff" and "the frame is on screen".
 
 ## Environment
 
-| | |
-|---|---|
-| CPU | Intel Core i7-10870H @ 2.20GHz, 16 threads |
-| RAM | 16 GB |
-| OS | Arch Linux, kernel 7.2.2 |
-| rustc | 1.95.0, `--release` |
-| SQLite | 3.53.4 (bundled via `rusqlite`) |
-| Date | 2026-09-12 |
+Two machines. The laptop is where the detail sections below were measured; the
+phone is where the kill criteria were re-run, and it is the one the budgets were
+written for.
+
+| | laptop | phone |
+|---|---|---|
+| CPU | Intel Core i7-10870H @ 2.20GHz, 16 threads | Snapdragon 720G — 2× Kryo 465 Gold @ 2.3GHz, 6× Silver @ 1.8GHz |
+| Device | — | Samsung SM-A725F (Galaxy A72) |
+| RAM | 16 GB | 7 GB |
+| OS | Arch Linux, kernel 7.2.2 | Android 16 (API 36), arm64-v8a |
+| rustc | 1.95.0, `--release` | 1.95.0, `--release`, NDK r28, minSdk 24 |
+| SQLite | 3.53.4 (bundled via `rusqlite`) | same, cross-compiled |
+| Date | 2026-09-12 | 2026-09-13 |
+
+The A72 is a 2020 mid-ranger and deliberately slower than the Pixel 6a plan §5.1
+names, so its numbers read the criterion pessimistically rather than
+generously.
 
 ## The workload
 
@@ -77,28 +87,40 @@ right one.
 
 ## Kill criteria
 
-| Metric | Budget | Measured | |
-|---|---|---|---|
-| p99 delta → `pump` returned | < 16ms | **190µs** | PASS |
-| Engine operator state | < 60MB | **80.7 KB** | PASS |
-| Peak anonymous RSS | < 60MB | **6.3 MB** | PASS |
-| `TopK` refills/sec at 200 rows/sec | < 5 | **1.4** | PASS |
-| Decode of a 1000-row view — Kotlin | < 5ms | **1.65ms** | PASS |
-| Decode of a 1000-row view — Dart, `package:protobuf` | < 5ms | **6.14ms** | **FAIL** |
-| Decode of a 1000-row view — Dart, zero-copy accessor | < 5ms | **8.30µs** | PASS |
-| APK size per ABI | < 8MB | 1.9–2.0 MB of cdylib, x86-64 | — |
+| Metric | Budget | Laptop | **Galaxy A72** | |
+|---|---|---|---|---|
+| p99 delta → `pump` returned | < 16ms | 190µs | **410–437µs** | PASS |
+| Engine operator state | < 60MB | 80.7 KB | **80.7 KB** | PASS |
+| Peak anonymous RSS | < 60MB | 6.3 MB | **6.5–6.6 MB** | PASS |
+| `TopK` refills/sec at 200 rows/sec | < 5 | 1.4 | **1.4** | PASS |
+| Decode of a 1000-row view — Kotlin | < 5ms | **1.65ms** | — | PASS |
+| Decode of a 1000-row view — Dart, `package:protobuf` | < 5ms | **6.14ms** | — | **FAIL** |
+| Decode of a 1000-row view — Dart, zero-copy accessor | < 5ms | **8.30µs** | — | PASS |
+| APK size per ABI | < 8MB | — | **1.73–1.84 MB** of cdylib, arm64-v8a | PASS |
+| Worst single pump | — | 409µs | **21.3–21.6ms** | see S3 |
 
-Peak *total* RSS is 68.2 MB, of which 61.9 MB is SQLite's reclaimable `mmap`
-window over an 89 MB database. Those pages are clean and file-backed: the kernel
-drops them under pressure and faults them back on the next read. The anonymous
-number is the one the engine actually owns and the one that gets a process
-killed, so that is the one measured against the budget. Reporting the total
-alone would show a near-failure caused entirely by a page cache doing its job.
+The decode rows are laptop-only because the hosts have not been cross-compiled
+yet; the phone columns are the engine, measured by
+[spike S3](#spike-s3--android-size-and-the-device-gate) on the device named
+above. The last row is not a criterion the plan states, and it is here because
+it is the only number in the table that behaves differently on a phone than on a
+laptop — 53× worse, where everything else is 2.5× worse. It is SQLite's WAL
+checkpoint running on the engine thread; S3 has the diagnosis.
+
+Peak *total* RSS is 68.2 MB on the laptop, of which 61.9 MB is SQLite's
+reclaimable `mmap` window over an 89 MB database (20.7 MB / 14.1 MB on the
+phone, which has less page cache to give). Those pages are clean and
+file-backed: the kernel drops them under pressure and faults them back on the
+next read. The anonymous number is the one the engine actually owns and the one
+that gets a process killed, so that is the one measured against the budget.
+Reporting the total alone would show a near-failure caused entirely by a page
+cache doing its job.
 
 Refills are reported per *mutation* and then multiplied by the plan's 200
 rows/sec write rate. The harness runs flat out, so its own refills-per-wall-
-second would be a fact about this laptop's clock speed rather than about the
-design.
+second would be a fact about the machine's clock speed rather than about the
+design. That the phone and the laptop agree at 1.4 is the point: refills are a
+property of the algorithm, not of the hardware.
 
 ### The first frame
 
@@ -279,10 +301,8 @@ less than the measurement's own run-to-run spread. That makes plan §4.3's
 batching (plan §4.2's one stream per `Database`) the Kotlin fix rather than a
 nicety.
 
-**An early read on the APK budget.** With SQLite 3.53 bundled, under the `mobile`
-profile (`opt-level=z`, `panic=abort`, stripped): **2.0 MB** for the Dart cdylib,
-**1.9 MB** for the Kotlin one. x86-64 Linux, so an indication and not a
-measurement, but the < 8MB budget is not obviously in danger.
+**An early read on the APK budget**, since superseded by S3: 2.0 MB and 1.9 MB
+of cdylib under the `mobile` profile, on x86-64 Linux.
 
 **Two generator asymmetries, found by compiling the generated code.** UniFFI 0.32
 cannot express an error field named `message` — it emits `val message` and
@@ -291,13 +311,69 @@ spell it `detail`. And `flutter_rust_bridge` renders a Rust enum-with-fields as 
 `freezed` sealed class, so `build_runner` is part of any Flutter consumer's build
 where UniFFI needs nothing extra.
 
+## Spike S3 — Android size, and the device gate
+
+S1 and S2 both ran on a laptop and both said so. S3 cross-compiles and runs the
+harness on a physical phone, which is where plan §9 puts the M0 gate, and
+measures the per-ABI size plan §7 lists as S3. Full write-up in
+[`spikes/s3-android/`](spikes/s3-android/).
+
+**Size, per ABI**, `mobile` profile, NDK r28, minSdk 24, SQLite bundled:
+
+| abi | `libsolstice_ffi_dart.so` | `libsolstice_ffi_kotlin.so` |
+|---|---|---|
+| arm64-v8a | **1.84 MB** | **1.73 MB** |
+| armeabi-v7a | **1.46 MB** | **1.40 MB** |
+
+Native libraries are stored uncompressed in an APK at every minSdk this project
+will support, so per-ABI APK growth is that number rather than a compressed
+fraction of it. It passes the < 8MB budget by more than 4×.
+
+**The engine is 3.7% of what ships.** By symbol bytes: SQLite 35% (of which
+13.5% is fts3/fts5/rtree, which plan §1.1 excludes from the query language),
+Rust std and dependencies 50%, `std::backtrace`'s gimli/addr2line/miniz\_oxide
+10%, all six `solstice-*` crates 3.7%, UniFFI scaffolding 1.7%. Writing less
+Rust is not how this library gets smaller. `build.sh --trim` removes the SQLite
+modules for a measured 14–18%, and is a flag rather than a default because
+§1.1's `queryOnce(rawSql)` escape hatch would stop being able to run a full-text
+query at all.
+
+**opt-level=z buys a third of the size for a third of the speed.** Against the
+same code at opt-level=3, both stripped, on the phone: 33–38% smaller, p99
+434µs → 584µs, hydration 3.51ms → 5.22ms. Both sides are inside both budgets, so
+at M0 the choice is free; the exchange rate is recorded because it will stop
+being free later.
+
+**The phone is 2.5× the laptop everywhere except one number, where it is 53×.**
+p50, p99 and hydration all scale by about 2.5×. The worst single pump goes from
+409µs to 21.3–21.6ms. Two experiments name it: in memory the outlier drops to
+904µs, and on disk with `wal_autocheckpoint=0` it drops to 1.09ms. It is
+SQLite's WAL checkpoint — 1000 pages by default — copying the WAL back and
+fsyncing **synchronously on the engine thread**, the thread plan §4.3 protects
+from long hydrations but not from this.
+
+The pragma is the diagnosis, not the fix: disabling autocheckpoint costs 15% on
+p99 and lets the WAL grow without bound. Moving the checkpoint onto a thread
+that is allowed to block is M1 work. Against the criterion as written nothing
+fails — p99 is 434µs against 16ms, and this is one pump in 2000 — but 21ms is a
+dropped frame and a half, it is reproducible rather than random, and it was
+invisible on a laptop.
+
+**16 KB pages.** Android 15 ships devices with 16 KB pages, where a library
+aligned to 4 KB does not load at all. NDK r28 aligns by default and r27 needs a
+linker flag, so `build.sh` verifies every 64-bit library it produces instead of
+trusting the toolchain version.
+
 ## What this does not yet prove
 
-- Nothing has run on a phone. A desktop has more cache, faster storage and no
-  competition for either. Kotlin is measured on HotSpot, and the JNA upcall S2
-  makes so much of is one of the things most likely to differ on ART.
-- S2 stops at the host, not at the frame. `mutate → delta at the host` is not
-  `delta → committed frame`; nothing here has laid out a list.
+- The engine has run on a phone; the *hosts* have not. Dart and Kotlin are still
+  measured on a laptop, and Kotlin on HotSpot rather than ART — the JNA upcall
+  S2 makes so much of is one of the things most likely to differ there.
+- Nothing stops at the frame. `mutate → delta at the host` is not `delta →
+  committed frame`; nothing here has laid out a list. The WAL finding is a
+  reason to measure that rather than to extrapolate it.
+- The APK is a cdylib, not an APK. Nothing yet checks what Gradle and AGP add
+  around it.
 - Two phases of synthetic traffic are not eight months of a real app. The
   self-check makes the view *correct*; it does not make the workload
   *representative*.
